@@ -9,6 +9,22 @@ from GNN_model.GNN_class import LightGCN
 from GNN_model.eval_GNN import GNNEvaluator
 from config import config
 from GNN_model.diagnostics import diagnose_embedding_scales
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+import torch.multiprocessing as mp
+
+
+def save_fsdp_model(model: FSDP, rank: int, save_path: str):
+    """Saves the FSDP model state dict using FULL_STATE_DICT type on rank 0."""
+    with FSDP.state_dict_type(model, statedict_type=StateDictType.FULL_STATE_DICT):
+        cpu_state = model.state_dict()
+    if rank == 0:
+        torch.save(cpu_state, save_path)
+        print(f"> FSDP model saved successfully to {save_path}")
+        return cpu_state
+    return None
 
 
 def check_prev_files():
@@ -89,28 +105,88 @@ def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path
     print("Embedding saving process complete.")
 
 
-def main():
-    torch.cuda.empty_cache()
-    train_graph = torch.load(config.paths.train_graph_file)
+def ddp_main(rank, world_size):
+    # Set the device for this process and initialize distributed
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
+    # Configure the rank's device
+    device = torch.device(f"cuda:{rank}")
+    config.gnn.device = device
+
+    if rank == 0:
+        print(f"World Size: {world_size}. Current Rank: {rank}. Device: {device}")
+
+    # Load data onto CPU (it is too large to fully replicate on each GPU)
+    train_graph = torch.load(config.paths.train_graph_file, map_location='cpu')
+
+    # --- Model Initialization & Diagnostics ---
     model = LightGCN(train_graph, config)
 
-    audio_scale, metadata_scale = diagnose_embedding_scales(model)
-    model.audio_scale = audio_scale
-    model.metadata_scale = metadata_scale
+    if rank == 0:
+        audio_scale, metadata_scale = diagnose_embedding_scales(model)
+    else:
+        audio_scale, metadata_scale = 0.0, 0.0
+
+        # Broadcast scales
+    broadcast_tensors = [torch.tensor(audio_scale, device=device), torch.tensor(metadata_scale, device=device)]
+    dist.broadcast(broadcast_tensors[0], src=0)
+    dist.broadcast(broadcast_tensors[1], src=0)
+    model.audio_scale = broadcast_tensors[0].item()
+    model.metadata_scale = broadcast_tensors[1].item()
+
+    # --- FSDP WRAPPER: The critical change for multi-GPU training ---
+    model.to(device)  # Move initial embeddings (user/item meta) to the GPU before wrapping
+    model = FSDP(
+        model,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=device,
+        # CPU offload is no longer needed/desired for full-GPU training
+    )
 
     trainer = GNNTrainer(model, train_graph, config)
-    trainer.train()
+    trainer.train(trial=False)  # Run training on all GPUs
 
-    model = trainer.model
-    del trainer
-    gc.collect()
-    torch.cuda.empty_cache()
+    # --- FSDP Model Save and Evaluation (only on Rank 0) ---
+    if rank == 0:
+        # Save the full state dict by gathering parameters onto rank 0
+        saved_state_dict = save_fsdp_model(model, rank, config.paths.trained_gnn)
 
-    model.load_state_dict(torch.load(config.paths.trained_gnn, map_location=config.gnn.device))
-    test_evaluation(model, train_graph)
+        # Load the saved state dict back into a new LightGCN model for evaluation
+        # We use the CPU state because evaluation is often done offline/on CPU
+        eval_model = LightGCN(train_graph, config)
+        eval_model.audio_scale = model.module.audio_scale  # FSDP module
+        eval_model.metadata_scale = model.module.metadata_scale
+        eval_model.load_state_dict(saved_state_dict)
 
-    save_final_embeddings(model, config.paths.user_embeddings_gnn, config.paths.song_embeddings_gnn)
+        # Cleanup
+        del saved_state_dict, trainer, model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Run test evaluation and save embeddings (original logic)
+        test_evaluation(eval_model, train_graph)
+        save_final_embeddings(eval_model, config.paths.user_embeddings_gnn, config.paths.song_embeddings_gnn)
+
+    dist.barrier()  # Wait for rank 0 to finish evaluation
+    dist.destroy_process_group()  # Cleanup
+
+
+def main():
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        print("Warning: Fewer than 2 GPUs detected. Launching single-GPU FSDP (still shards embeddings).")
+        # For development/testing, we can run with a world size of 1
+
+    # Use torch.multiprocessing.spawn to launch the workers
+    print(f"Launching distributed FSDP training on {world_size} GPUs...")
+    mp.spawn(
+        ddp_main,
+        args=(world_size,),
+        nprocs=world_size,
+        join=True
+    )
 
 
 if __name__ == "__main__":

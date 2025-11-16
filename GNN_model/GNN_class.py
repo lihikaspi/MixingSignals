@@ -177,188 +177,14 @@ class LightGCN(nn.Module):
 
         return item_embed
 
-    def forward(self, return_projections=False):
+    def forward(self, batch_nodes, edge_index_sub, edge_weight_init_sub):
         """
-        Full-graph forward (used for evaluation / saving final embeddings).
-        Assumes model and data are moved to device *before* calling.
-        """
-        device = next(self.parameters()).device
+        Primary forward pass for a sampled subgraph (mini-batch training).
 
-        # Move edge data to device
-        edge_index = self.edge_index.to(device)
-        edge_weight = self.edge_weight_init.to(device)
-
-        # --- DYNAMIC SELF-LOOP FIX ---
-        # Add self-loops to the edge index *and* weights for normalization stability
-        edge_index_with_loops, edge_weight_with_loops = add_remaining_self_loops(
-            edge_index, edge_weight, fill_value=1.0, num_nodes=self.num_nodes_total
-        )
-        # --- END FIX ---
-
-        # Initial embeddings
-        user_nodes = torch.arange(self.num_users, device=device)
-        item_nodes = torch.arange(self.num_items, device=device)
-
-        user_embed = F.normalize(self.user_emb(user_nodes), p=2, dim=-1, eps=1e-12)
-        item_embed = self._get_item_embeddings(item_nodes, device)
-
-        x = torch.cat([user_embed, item_embed], dim=0)
-        all_emb_sum = x
-
-        for conv in self.convs:
-            # Pass the tensors *with self-loops* to the conv layer
-            x = conv(x, edge_index_with_loops, edge_weight=edge_weight_with_loops)
-            all_emb_sum = all_emb_sum + x
-
-        x = all_emb_sum / (self.num_layers + 1)
-        x = F.normalize(x, p=2, dim=-1, eps=1e-12)
-
-        user_emb = x[:self.num_users]
-        item_emb = x[self.num_users:]
-
-        align_loss = torch.tensor(0.0, device=device)
-        return user_emb, item_emb, align_loss
-
-    def forward_cpu(self):
-        """
-        Performs the full-graph forward pass with GNN propagation on CPU.
-        """
-
-        # --- 1. Set up devices ---
-        # The main computation device (for GNN conv) is CPU.
-        cpu_device = torch.device('cpu')
-
-        # The model's parameters (e.g., user_emb) should be on the CPU,
-        # as set by the GNNTrainer.
-        model_device = next(self.parameters()).device
-        if model_device != cpu_device:
-            print(
-                f"    > forward_cpu: Warning: Model parameters are on {model_device}, expected {cpu_device}. Moving to CPU.")
-            self.to(cpu_device)
-            model_device = cpu_device
-
-        # --- OOM HOTFIX ---
-        # The hybrid GPU acceleration is incompatible with the retain_graph=True
-        # training loop. The entire graph MUST live on the CPU.
-        # We now force the "gpu_device" (used for L0 embs) to be the "cpu_device".
-
-        gpu_device = cpu_device  # Force CPU
-        print(f"    > forward_cpu: Forcing L0 embedding creation to CPU to prevent OOM.")
-
-        # --- OLD HYBRID LOGIC (DISABLED) ---
-        # gpu_device = None
-        # if torch.cuda.is_available():
-        #     try:
-        #         gpu_device = torch.device(self.config.gnn.device)  # e.g., 'cuda:0'
-        #         print(f"    > forward_cpu: Found GPU. Accelerating L0 embedding creation on {gpu_device}.")
-        #     except Exception as e:
-        #         print(
-        #             f"    > forward_cpu: Error setting GPU device {self.config.gnn.device}: {e}. Falling back to CPU.")
-        #         gpu_device = cpu_device
-        # else:
-        #     print("    > forward_cpu: No GPU found. Running L0 embedding creation on CPU.")
-        #     gpu_device = cpu_device  # Fallback to CPU
-        # --- END OOM HOTFIX ---
-
-        # --- 2. Get edge data (all on CPU) ---
-        edge_weight_cpu = self.edge_weight_init.to(cpu_device)
-        edge_index_cpu = self.edge_index.to(cpu_device)
-
-        edge_index_with_loops, edge_weight_with_loops = add_remaining_self_loops(
-            edge_index_cpu, edge_weight_cpu, fill_value=1.0, num_nodes=self.num_nodes_total
-        )
-
-        # --- 3. Get L0 User Embeddings (Hybrid CPU/GPU) ---
-        # --- MODIFIED: Offload user norm to GPU if available ---
-        print("    > forward_cpu: Normalizing L0 User Embeddings...")
-        # This will use the CPU (since gpu_device == cpu_device)
-        user_emb_gpu = self.user_emb.weight.to(gpu_device)
-        user_embed_gpu_norm = F.normalize(user_emb_gpu, p=2, dim=-1, eps=1e-12)
-        user_embed = user_embed_gpu_norm.to(cpu_device)
-        del user_emb_gpu, user_embed_gpu_norm  # Free VRAM
-        if gpu_device != cpu_device:
-            torch.cuda.empty_cache()
-        print("    > forward_cpu: L0 User Embeddings complete.")
-        # --- END MODIFIED ---
-
-        # --- 4. Get L0 Item Embeddings (Hybrid CPU/GPU) ---
-        print("    > forward_cpu: Calculating L0 Item Embeddings (Hybrid)...")
-        # Move relevant parameters *temporarily* to the GPU (if available)
-        self.artist_emb.to(gpu_device)
-        self.album_emb.to(gpu_device)
-        self.item_project.to(gpu_device)  # UNIFIED (Request 3)
-        if self.audio_proj is not None:
-            self.audio_proj.to(gpu_device)
-
-        batch_size = 10000
-        item_embeds_cpu_list = []
-
-        # We iterate over items, compute embeddings on GPU, move back to CPU
-        for i in range(0, self.num_items, batch_size):
-            end_idx = min(i + batch_size, self.num_items)
-
-            # Create the batch of node indices *on the GPU*
-            # This will use the CPU (since gpu_device == cpu_device)
-            batch_item_nodes_gpu = torch.arange(i, end_idx, device=gpu_device)
-
-            # This calculation now runs on the GPU
-            # This will use the CPU (since gpu_device == cpu_device)
-            item_embed_batch_gpu = self._get_item_embeddings(batch_item_nodes_gpu, gpu_device)
-
-            # Move the result *back to the CPU*
-            item_embeds_cpu_list.append(item_embed_batch_gpu.cpu())
-
-        # Move parameters *back to the model's original device* (CPU)
-        self.artist_emb.to(model_device)
-        self.album_emb.to(model_device)
-        self.item_project.to(model_device)  # UNIFIED (Request 3)
-        if self.audio_proj is not None:
-            self.audio_proj.to(model_device)
-        if gpu_device != cpu_device:
-            torch.cuda.empty_cache()  # Clean up VRAM
-
-        # Concatenate all CPU batches
-        item_embed = torch.cat(item_embeds_cpu_list, dim=0)
-        del item_embeds_cpu_list  # Free memory
-        print("    > forward_cpu: L0 Item Embeddings complete.")
-
-        # --- 5. Concatenate L0 Embeddings (on CPU) ---
-        x = torch.cat([user_embed, item_embed], dim=0)
-        del user_embed, item_embed
-
-        # --- 6. Run GNN Propagation (on CPU) ---
-        print("    > forward_cpu: Starting GNN propagation on CPU...")
-        all_emb_sum = x
-
-        for i, conv in enumerate(self.convs):
-            print(f"    > forward_cpu: GNN Layer {i + 1}/{self.num_layers}...")
-            # This is the slow part that runs on CPU (as intended)
-            x = conv(x, edge_index_with_loops, edge_weight=edge_weight_with_loops)
-            all_emb_sum = all_emb_sum + x
-
-        print("    > forward_cpu: GNN propagation complete.")
-
-        # --- 7. Final Aggregation & Normalization (on CPU) ---
-        # Stays on CPU to avoid massive H2D/D2H copies
-        print("    > forward_cpu: Final aggregation and normalization on CPU...")
-        x = all_emb_sum / (self.num_layers + 1)
-        del all_emb_sum
-
-        x = F.normalize(x, p=2, dim=-1, eps=1e-12)
-
-        user_emb = x[:self.num_users]
-        item_emb = x[self.num_users:]
-
-        align_loss_placeholder = torch.tensor(0.0, device=cpu_device)
-
-        print("    > forward_cpu: Complete.")
-        return user_emb, item_emb, align_loss_placeholder
-
-    def forward_subgraph(self, batch_nodes, edge_index_sub, edge_weight_init_sub):
-        """
-        Forward pass on a subgraph with proper embedding combination.
-        (Not used in the CPU-based training loop, but kept for completeness
-         and potential future use)
+        Args:
+            batch_nodes (Tensor): Homogeneous node indices for the subgraph.
+            edge_index_sub (Tensor): Edge index for the subgraph.
+            edge_weight_init_sub (Tensor): Edge weights for the subgraph.
         """
         device = next(self.parameters()).device
 
@@ -379,10 +205,12 @@ class LightGCN(nn.Module):
         user_mask = batch_nodes < self.num_users
         item_mask = ~user_mask
 
+        # Get the original user_idx and the zero-indexed item_idx
         user_nodes = batch_nodes[user_mask]
-        item_nodes = batch_nodes[item_mask] - self.num_users
+        item_nodes = batch_nodes[item_mask] - self.num_users  # Zero-indexed item ID
 
         # Get embeddings
+        # FSDP manages parameter access, this is fine
         user_embed = F.normalize(self.user_emb(user_nodes), p=2, dim=-1, eps=1e-12)
         item_embed = self._get_item_embeddings(item_nodes, device)
 
@@ -400,4 +228,6 @@ class LightGCN(nn.Module):
         x_sub = torch.stack(all_emb, dim=0).mean(dim=0)
         x_sub = F.normalize(x_sub, p=2, dim=-1, eps=1e-12)
 
-        return x_sub, user_nodes, item_nodes
+        # Return the final node embeddings (subgraph order), the user/item indices in the subgraph
+        # and the original user/item indices for loss calculation
+        return x_sub, user_nodes, item_nodes  # item_nodes are zero-indexed item IDs

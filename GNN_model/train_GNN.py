@@ -11,6 +11,7 @@ from GNN_model.eval_GNN import GNNEvaluator
 from config import Config
 from collections import defaultdict
 import pandas as pd
+import torch.optim
 
 
 class BPRDataset(Dataset):
@@ -213,13 +214,13 @@ class GNNTrainer:
     def __init__(self, model: LightGCN, train_graph, config: Config):
         self.config = config
 
-        # --- UNIFIED (Request 1): CPU-ONLY Strategy ---
-        # Force to CPU to avoid OOM errors on the full-graph pass
-        self.device = torch.device('cpu')
-        print(f"--- GNNTrainer: Forcing all training to CPU to avoid OOM. ---")
-        self.model = model.to(self.device)
-        self.train_graph = train_graph.to(self.device)
-        # --- END FIX ---
+        # --- MODIFIED: FULL-GPU Strategy ---
+        # The model is now wrapped in FSDP in run_GNN_train.py and moved to GPU
+        self.device = config.gnn.device
+        print(f"--- GNNTrainer: Using FSDP for multi-GPU training on {self.device}. ---")
+        self.model = model  # The model is already FSDP-wrapped here
+        self.train_graph = train_graph.to('cpu')  # Keep graph on CPU for memory
+        # --- END MODIFIED ---
 
         self.batch_size = config.gnn.batch_size
         self.num_epochs = config.gnn.num_epochs
@@ -288,13 +289,11 @@ class GNNTrainer:
         # --- END DATALOADER ---
 
         # Get data from the *model* buffers, which are already homogeneous
-        self.edge_index_full = self.model.edge_index.cpu()
-        self.edge_weight_full = self.model.edge_weight_init.cpu()
+        self.edge_index_full = self.model.module.edge_index.cpu()  # Access module inside FSDP
+        self.edge_weight_full = self.model.module.edge_weight_init.cpu()
 
         self.lr_base = config.gnn.lr
-        self.lr_decay = config.gnn.lr_decay
-        self.weight_decay = config.gnn.weight_decay
-        self.max_grad_norm = config.gnn.max_grad_norm
+        # ... (remove lr_decay, weight_decay, max_grad_norm, etc.)
 
         self.dropout = config.gnn.dropout
         self.margin = config.gnn.margin
@@ -306,50 +305,23 @@ class GNNTrainer:
         self.best_ndcg = 0.0
         self.best_metrics = None
 
-    def _get_lr(self, epoch):
-        """
-        Learning rate schedule with warmup and CYCLICAL decay (Cosine Annealing).
-        """
-        # --- WARMUP (same as before) ---
-        if self.step_count == 0:
-            return self.lr_base * (1 / self.warmup_steps)
-        if self.step_count < self.warmup_steps:
-            return self.lr_base * (self.step_count / self.warmup_steps)
+        # --- NEW: Standard PyTorch Optimizer and Scheduler ---
+        # FSDP manages the sharded parameters automatically
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=config.gnn.lr,
+            weight_decay=config.gnn.weight_decay,
+        )
 
-        # --- CYCLICAL DECAY (NEW) ---
-        epochs_per_cycle = 5
-        current_epoch_in_cycle = (epoch - (self.warmup_steps / len(self.loader))) % epochs_per_cycle
-        min_lr = 1e-6  # A very small minimum LR
-        cos_inner = (math.pi * current_epoch_in_cycle) / epochs_per_cycle
-        current_lr = min_lr + (self.lr_base - min_lr) * (1 + math.cos(cos_inner)) / 2
-        return current_lr
-
-    def _update_parameters(self, lr):
-        """
-        Pure SGD update with per-parameter LR and weight decay.
-        """
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if param.grad is None:
-                    continue
-
-                if 'user_emb' in name:
-                    param_lr = lr * 1.0
-                elif 'artist_emb' in name or 'album_emb' in name:
-                    param_lr = lr * 2.0
-                else:
-                    param_lr = lr
-
-                grad = param.grad.data
-                if self.weight_decay > 0 and 'emb' in name:
-                    grad = grad.add(param.data, alpha=self.weight_decay)
-
-                param.data.add_(grad, alpha=-param_lr)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizer,
+            gamma=config.gnn.lr_decay
+        )
 
     def train(self, trial=False):
-        print(f">>> starting training with ADVANCED BPR ranking loss (on CPU)")
-        os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-        self.model.to(self.device)  # Ensure model is on CPU
+        print(f">>> starting training with ADVANCED BPR ranking loss (on GPU with FSDP)")
+        # Note: Model saving will be handled by the root process in run_GNN_train.py
+        self.model.train()  # Model is already on GPU, wrapped in FSDP
 
         patience = 0
         max_patience = 10
@@ -361,36 +333,76 @@ class GNNTrainer:
             epoch_grad_norm = 0.0
             num_batches = 0
 
-            current_lr = self._get_lr(epoch)
+            # --- MODIFIED: REMOVE FULL-GRAPH FORWARD PASS ---
+            # The trainer now does *not* pre-compute all embeddings
 
-            # --- UNIFIED (Request 1): EPOCH-LEVEL FORWARD PASS ---
-            print(f">>> Epoch {epoch}: Running full-graph CPU forward pass...")
-
-            # REMOVED the `with torch.no_grad():` block.
-            # This forward pass MUST track gradients.
-            all_user_embs_final, all_item_embs_final, _ = self.model.forward_cpu()
-
-            print(f">>> CPU forward pass complete. Starting BPR batches...")
-            # all_user_embs_final and all_item_embs_final are now on CPU
-            # --- END UNIFIED ---
-
-            progress = tqdm(self.loader, desc=f"Epoch {epoch} (LR={current_lr:.6f})", leave=True)
+            progress = tqdm(self.loader, desc=f"Epoch {epoch} (LR={self.optimizer.param_groups[0]['lr']:.6f})",
+                            leave=True)
 
             for batch_idx, batch in enumerate(progress):
+
                 # --- 1. Unpack batch ---
                 (u_idx, i_pos_idx,
                  i_neg_idx_tensor, i_neg_audio_embeds_tensor, i_neg_is_cold_start_tensor,
                  pos_weights, neg_weights) = batch
 
-                # --- 2. Build Subgraph (REMOVED) ---
-                # All subgraph logic is removed, as we now use the pre-computed embeddings
+                # --- 2. Build Subgraph for Training (Mini-batch GNN) ---
+                # We need a subgraph that includes all sampled users (u_idx) and their positive/negative items.
+                # Since we don't use NeighborLoader here, we construct a simple 1-layer subgraph
+                # that contains the sampled users and all items, using the full graph's edges.
 
-                # --- 3. Forward Pass (REMOVED) ---
-                # We no longer call forward_subgraph
+                # Identify all nodes involved in the batch (users and all their sampled pos/neg items)
+                # Note: This is a placeholder for a true NeighborLoader/subgraph sampling strategy,
+                # but it forces the logic into the batch loop for DDP/FSDP compatibility.
 
-                # --- 4. Map nodes and Calculate BPR Loss (Using pre-computed embs) ---
+                # Homogeneous node indices for this batch
+                # All users are in the batch, all items are potentially in the batch (pos, neg, cold-start)
 
-                # Move all batch tensors to device (which is CPU)
+                # Get the nodes used in this batch
+                all_nodes_flat = torch.cat([
+                    u_idx,
+                    i_pos_idx,
+                    i_neg_idx_tensor.flatten()
+                ]).unique()
+
+                # Filter out cold-start items (-1 index)
+                batch_nodes = all_nodes_flat[all_nodes_flat != -1]
+
+                # Create a simple, synthetic subgraph of the required nodes
+                # Since the full graph is too big, this is the most direct way to get DDP working
+                # without fully migrating to a full PyG mini-batch sampler.
+
+                # Map nodes to the new subgraph indices (0 to len(batch_nodes) - 1)
+                node_map = {node.item(): i for i, node in enumerate(batch_nodes)}
+
+                # Filter edges that are between nodes present in batch_nodes
+                mask = (
+                        torch.isin(self.edge_index_full[0], batch_nodes) &
+                        torch.isin(self.edge_index_full[1] - self.num_users, batch_nodes)
+                )
+
+                edge_index_sub = self.edge_index_full[:, mask]
+                edge_weight_sub = self.edge_weight_full[mask]
+
+                # Remap edges to local indices
+                src = torch.tensor([node_map[s.item()] for s in edge_index_sub[0]])
+                dst = torch.tensor([node_map[d.item()] for d in edge_index_sub[1]])
+                edge_index_sub_remapped = torch.stack([src, dst], dim=0)
+
+                # --- 3. Forward Pass (Subgraph Propagation) ---
+                # This is the actual GNN layer call that will use the GPU
+                sub_embs, sub_user_indices, sub_item_indices = self.model(
+                    batch_nodes,
+                    edge_index_sub_remapped,
+                    edge_weight_sub
+                )
+
+                # Get the mapping from original user/item ID to the subgraph embedding index
+                original_to_subgraph_idx = {node.item(): i for i, node in enumerate(batch_nodes)}
+
+                # --- 4. Map nodes and Calculate BPR Loss (Using Subgraph Embs) ---
+
+                # All batch tensors move to device (GPU)
                 u_idx_batch = u_idx.to(self.device)
                 i_pos_idx_batch = i_pos_idx.to(self.device)
                 i_neg_idx_batch = i_neg_idx_tensor.to(self.device)
@@ -399,35 +411,36 @@ class GNNTrainer:
                 pos_weights_batch = pos_weights.to(self.device)
                 neg_weights_batch = neg_weights.to(self.device)
 
-                # --- Get Positive Embeddings ---
-                # We lookup from the pre-computed full-graph embeddings
-                u_emb = all_user_embs_final[u_idx_batch]  # [B, D]
-                pos_i_emb = all_item_embs_final[i_pos_idx_batch]  # [B, D]
+                B, K, D = u_idx_batch.size(0), self.neg_samples_per_pos, self.embed_dim
 
-                # --- Get Negative Embeddings (All 3 Cases) ---
-                neg_i_emb = torch.zeros(
-                    self.batch_size,
-                    self.neg_samples_per_pos,
-                    self.embed_dim,
-                    device=self.device
-                )
+                # --- Get Positive and User Embeddings (from subgraph) ---
+                u_emb = torch.zeros((B, D), device=self.device)
+                pos_i_emb = torch.zeros((B, D), device=self.device)
+
+                for i in range(B):
+                    u_sub_idx = original_to_subgraph_idx[u_idx_batch[i].item()]
+                    i_pos_sub_idx = original_to_subgraph_idx[i_pos_idx_batch[i].item()]
+                    u_emb[i] = sub_embs[u_sub_idx]
+                    pos_i_emb[i] = sub_embs[i_pos_sub_idx]
+
+                # --- Get Negative Embeddings (In-Graph from subgraph, Cold-Start from audio) ---
+                neg_i_emb = torch.zeros((B, K, D), device=self.device)
 
                 # Case 3: Cold-Start (Not in graph)
-                # Use pre-computed audio embedding
                 neg_i_emb[neg_is_cold_start_batch] = neg_audio_embeds_batch[neg_is_cold_start_batch]
 
-                # --- Handle In-Graph Negatives (Case 1 & 2) ---
-                # This logic is now much simpler.
+                # Handle In-Graph Negatives (Case 1 & 2)
                 in_graph_mask = ~neg_is_cold_start_batch
-                in_graph_nodes_flat = i_neg_idx_batch[in_graph_mask]  # 1D tensor of in-graph node indices
+                in_graph_nodes = i_neg_idx_batch[in_graph_mask]  # Original indices of in-graph items
 
-                if in_graph_nodes_flat.numel() > 0:
-                    # All in-graph nodes have a pre-computed final embedding.
-                    # We just look them up from the full item embedding table.
-                    in_graph_embeds_flat = all_item_embs_final[in_graph_nodes_flat]
-
-                    # Scatter flat results back to [B, k, D] shape
-                    neg_i_emb[in_graph_mask] = in_graph_embeds_flat
+                # Lookup subgraph embedding index
+                for i in range(B):
+                    for j in range(K):
+                        if in_graph_mask[i, j]:
+                            orig_node = in_graph_nodes[i * K + j].item()
+                            sub_idx = original_to_subgraph_idx.get(orig_node)
+                            if sub_idx is not None:
+                                neg_i_emb[i, j] = sub_embs[sub_idx]
 
                 # --- ADD NODE/EMBEDDING DROPOUT ---
                 if self.model.training:
@@ -454,24 +467,24 @@ class GNNTrainer:
                     raise ValueError("NaN/Inf in BPR loss. Stopping training.")
 
                 loss = loss / self.accum_steps
-                loss.backward(retain_graph=True)
+                # FSDP requires the loss to be on the same device as the model/optimizer
+                loss.backward()
 
                 # --- 5. Optimizer Step ---
                 if (batch_idx + 1) % self.accum_steps == 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.max_grad_norm
+                        self.model.parameters(), self.config.gnn.max_grad_norm
                     )
 
                     if not np.isfinite(grad_norm.item()):
                         print(f"\n!!! NaN/Inf GRADIENT detected at epoch {epoch}, batch {batch_idx}!!!")
-                        self.model.zero_grad(set_to_none=True)
+                        self.optimizer.zero_grad(set_to_none=True)
                     else:
                         self.step_count += 1
-                        current_step_lr = self._get_lr(epoch)
-                        self._update_parameters(current_step_lr)
+                        self.optimizer.step()
                         epoch_grad_norm += grad_norm.item()
 
-                    self.model.zero_grad(set_to_none=True)
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 epoch_loss += loss.item() * self.accum_steps
                 num_batches += 1
@@ -480,12 +493,15 @@ class GNNTrainer:
                     'bpr_loss': f'{epoch_loss / num_batches:.6f}',
                 })
 
-            self.model.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad(set_to_none=True)
             progress.close()
             avg_loss = epoch_loss / num_batches
             avg_grad = epoch_grad_norm / (num_batches / self.accum_steps)
 
             print(f"Epoch {epoch} | BPR Loss: {avg_loss:.6f} | Avg grad: {avg_grad:.4f}")
+
+            if self.step_count >= self.warmup_steps and epoch > 1:
+                self.scheduler.step()
 
             # --- 6. Evaluation ---
             self.model.eval()
@@ -500,13 +516,7 @@ class GNNTrainer:
             # --- END UNIFIED ---
 
             if cur_ndcg > self.best_ndcg:
-                improvement = cur_ndcg - self.best_ndcg
-                self.best_ndcg = cur_ndcg
-                self.best_metrics = val_metrics
-                patience = 0
-                if not trial:
-                    torch.save(self.model.state_dict(), self.save_path)
-                    print(f"> Best model saved ({improvement:.6f})")
+                pass
             else:
                 patience += 1
                 print(f"No improvement ({patience}/{max_patience})")
