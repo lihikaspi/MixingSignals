@@ -21,7 +21,7 @@ class BPRDataset(Dataset):
     """
 
     def __init__(self, train_graph, config: Config, raw_user2neg: dict):
-        print(">>> Initializing Advanced BPRDataset...")
+        # print(">>> Initializing Advanced BPRDataset...")
 
         # All edges are now positive in the graph
         edge_index = train_graph['user', 'interacts', 'item'].edge_index
@@ -52,7 +52,7 @@ class BPRDataset(Dataset):
         pos_types = [self.edge_type_mapping[k] for k in ["listen", "like", "undislike"]]
 
         # 1. Extract POSITIVE interactions from the graph
-        print("    Building user-to-item positive map from graph...")
+        # print("    Building user-to-item positive map from graph...")
         # UNIFIED: Add 'r' (ratio) to the loop
         for u, i, t, r in zip(user_idx.tolist(), item_idx.tolist(), edge_types.tolist(), edge_ratios.tolist()):
             t_int = int(round(t))
@@ -63,7 +63,7 @@ class BPRDataset(Dataset):
                 self.all_users_pos_sets[u].add(i)  # Add to set for fast lookup
 
         # 2. Process the pre-loaded RAW hard negative map
-        print("    Cleaning hard negative lists...")
+        # print("    Cleaning hard negative lists...")
         for u, neg_tuples in raw_user2neg.items():
             pos_set_for_user = self.all_users_pos_sets.get(u, set())
             cleaned_negs = []
@@ -216,7 +216,7 @@ class GNNTrainer:
         # --- UNIFIED (Request 1): CPU-ONLY Strategy ---
         # Force to CPU to avoid OOM errors on the full-graph pass
         self.device = torch.device('cpu')
-        print(f"--- GNNTrainer: Forcing all training to CPU to avoid OOM. ---")
+        # print(f"--- GNNTrainer: Forcing all training to CPU to avoid OOM. ---")
         self.model = model.to(self.device)
         self.train_graph = train_graph.to(self.device)
         # --- END FIX ---
@@ -228,7 +228,7 @@ class GNNTrainer:
         self.embed_dim = config.gnn.embed_dim  # Store embed_dim
 
         # --- Load and process negative interactions ONCE ---
-        print(">>> GNNTrainer: Building item ID to graph index map...")
+        # print(">>> GNNTrainer: Building item ID to graph index map...")
         # .cpu() is important if graph was loaded to GPU
         item_original_ids = train_graph['item'].item_id.cpu().numpy()
         item_id_to_graph_idx = {item_id: i for i, item_id in enumerate(item_original_ids)}
@@ -238,10 +238,10 @@ class GNNTrainer:
 
         # 1. Load IN-GRAPH negatives (lightweight)
         in_graph_neg_file = config.paths.negative_train_in_graph_file
-        print(f">>> GNNTrainer: Loading IN-GRAPH negatives from {in_graph_neg_file}...")
+        # print(f">>> GNNTrainer: Loading IN-GRAPH negatives from {in_graph_neg_file}...")
         neg_in_graph_df = pd.read_parquet(in_graph_neg_file, columns=['user_id', 'item_id'])
 
-        print(">>> GNNTrainer: Processing IN-GRAPH negatives...")
+        # print(">>> GNNTrainer: Processing IN-GRAPH negatives...")
         for row in neg_in_graph_df.itertuples(index=False):
             item_train_idx = item_id_to_graph_idx.get(row.item_id, -1)
             # Should always be found, but check just in case
@@ -251,20 +251,20 @@ class GNNTrainer:
 
         # 2. Load COLD-START negatives (heavy but smaller)
         cold_start_neg_file = config.paths.negative_train_cold_start_file
-        print(f">>> GNNTrainer: Loading COLD-START negatives from {cold_start_neg_file}...")
+        # print(f">>> GNNTrainer: Loading COLD-START negatives from {cold_start_neg_file}...")
         neg_cold_start_df = pd.read_parquet(cold_start_neg_file, columns=['user_id', 'normalized_embed'])
 
-        print(">>> GNNTrainer: Processing COLD-START negatives...")
+        # print(">>> GNNTrainer: Processing COLD-START negatives...")
         for row in neg_cold_start_df.itertuples(index=False):
             # item_train_idx is -1, and we pass the embedding
             raw_user2neg_map[row.user_id].append((-1, row.normalized_embed))
         del neg_cold_start_df  # Free memory
 
-        print(f">>> GNNTrainer: Loaded {len(raw_user2neg_map)} users with hard negatives.")
+        # print(f">>> GNNTrainer: Loaded {len(raw_user2neg_map)} users with hard negatives.")
         # --- END NEW ---
 
         # --- UNIFIED (Request 2): Use the Advanced BPRDataset ---
-        print(">>> GNNTrainer: Initializing BPRDataset...")
+        # print(">>> GNNTrainer: Initializing BPRDataset...")
         self.dataset = BPRDataset(train_graph, config, raw_user2neg_map)
 
         # Get node counts from model and dataset
@@ -317,7 +317,7 @@ class GNNTrainer:
             return self.lr_base * (self.step_count / self.warmup_steps)
 
         # --- CYCLICAL DECAY (NEW) ---
-        epochs_per_cycle = 5
+        epochs_per_cycle = 3
         current_epoch_in_cycle = (epoch - (self.warmup_steps / len(self.loader))) % epochs_per_cycle
         min_lr = 1e-6  # A very small minimum LR
         cos_inner = (math.pi * current_epoch_in_cycle) / epochs_per_cycle
@@ -356,6 +356,8 @@ class GNNTrainer:
 
         for epoch in range(1, self.num_epochs + 1):
             self.model.train()
+
+            self.model.to(self.device)
 
             epoch_loss = 0.0
             epoch_grad_norm = 0.0
@@ -404,9 +406,10 @@ class GNNTrainer:
                 u_emb = all_user_embs_final[u_idx_batch]  # [B, D]
                 pos_i_emb = all_item_embs_final[i_pos_idx_batch]  # [B, D]
 
+                current_batch_size = u_idx_batch.size(0)
                 # --- Get Negative Embeddings (All 3 Cases) ---
                 neg_i_emb = torch.zeros(
-                    self.batch_size,
+                    current_batch_size,  # Use dynamic batch size
                     self.neg_samples_per_pos,
                     self.embed_dim,
                     device=self.device

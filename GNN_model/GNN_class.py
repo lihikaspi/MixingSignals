@@ -243,7 +243,7 @@ class LightGCN(nn.Module):
         # We now force the "gpu_device" (used for L0 embs) to be the "cpu_device".
 
         gpu_device = cpu_device  # Force CPU
-        print(f"    > forward_cpu: Forcing L0 embedding creation to CPU to prevent OOM.")
+        # print(f"    > forward_cpu: Forcing L0 embedding creation to CPU to prevent OOM.")
 
         # --- OLD HYBRID LOGIC (DISABLED) ---
         # gpu_device = None
@@ -270,7 +270,7 @@ class LightGCN(nn.Module):
 
         # --- 3. Get L0 User Embeddings (Hybrid CPU/GPU) ---
         # --- MODIFIED: Offload user norm to GPU if available ---
-        print("    > forward_cpu: Normalizing L0 User Embeddings...")
+        # print("    > forward_cpu: Normalizing L0 User Embeddings...")
         # This will use the CPU (since gpu_device == cpu_device)
         user_emb_gpu = self.user_emb.weight.to(gpu_device)
         user_embed_gpu_norm = F.normalize(user_emb_gpu, p=2, dim=-1, eps=1e-12)
@@ -278,11 +278,11 @@ class LightGCN(nn.Module):
         del user_emb_gpu, user_embed_gpu_norm  # Free VRAM
         if gpu_device != cpu_device:
             torch.cuda.empty_cache()
-        print("    > forward_cpu: L0 User Embeddings complete.")
+        # print("    > forward_cpu: L0 User Embeddings complete.")
         # --- END MODIFIED ---
 
         # --- 4. Get L0 Item Embeddings (Hybrid CPU/GPU) ---
-        print("    > forward_cpu: Calculating L0 Item Embeddings (Hybrid)...")
+        # print("    > forward_cpu: Calculating L0 Item Embeddings (Hybrid)...")
         # Move relevant parameters *temporarily* to the GPU (if available)
         self.artist_emb.to(gpu_device)
         self.album_emb.to(gpu_device)
@@ -320,27 +320,27 @@ class LightGCN(nn.Module):
         # Concatenate all CPU batches
         item_embed = torch.cat(item_embeds_cpu_list, dim=0)
         del item_embeds_cpu_list  # Free memory
-        print("    > forward_cpu: L0 Item Embeddings complete.")
+        # print("    > forward_cpu: L0 Item Embeddings complete.")
 
         # --- 5. Concatenate L0 Embeddings (on CPU) ---
         x = torch.cat([user_embed, item_embed], dim=0)
         del user_embed, item_embed
 
         # --- 6. Run GNN Propagation (on CPU) ---
-        print("    > forward_cpu: Starting GNN propagation on CPU...")
+        # print("    > forward_cpu: Starting GNN propagation on CPU...")
         all_emb_sum = x
 
         for i, conv in enumerate(self.convs):
-            print(f"    > forward_cpu: GNN Layer {i + 1}/{self.num_layers}...")
+            # print(f"    > forward_cpu: GNN Layer {i + 1}/{self.num_layers}...")
             # This is the slow part that runs on CPU (as intended)
             x = conv(x, edge_index_with_loops, edge_weight=edge_weight_with_loops)
             all_emb_sum = all_emb_sum + x
 
-        print("    > forward_cpu: GNN propagation complete.")
+        # print("    > forward_cpu: GNN propagation complete.")
 
         # --- 7. Final Aggregation & Normalization (on CPU) ---
         # Stays on CPU to avoid massive H2D/D2H copies
-        print("    > forward_cpu: Final aggregation and normalization on CPU...")
+        # print("    > forward_cpu: Final aggregation and normalization on CPU...")
         x = all_emb_sum / (self.num_layers + 1)
         del all_emb_sum
 
@@ -351,7 +351,7 @@ class LightGCN(nn.Module):
 
         align_loss_placeholder = torch.tensor(0.0, device=cpu_device)
 
-        print("    > forward_cpu: Complete.")
+        # print("    > forward_cpu: Complete.")
         return user_emb, item_emb, align_loss_placeholder
 
     def forward_subgraph(self, batch_nodes, edge_index_sub, edge_weight_init_sub):
