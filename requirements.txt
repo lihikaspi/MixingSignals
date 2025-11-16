@@ -12,9 +12,10 @@ pyarrow==21.0.0
 scikit-learn==1.7.2
 seaborn==0.13.2
 torch==2.0.1+cu118
-torch-geometric==2.7.0
 torch-scatter==2.1.2+pt20cu118
 torch-sparse==0.6.18+pt20cu118
+# TODO: add other PyG dependencies
+torch-geometric==2.7.0
 tqdm==4.67.1
 typing==3.7.4.3
 optuna==4.5.0
