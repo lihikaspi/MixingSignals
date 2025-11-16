@@ -6,7 +6,8 @@ import pandas as pd
 
 class EventProcessor:
     """
-    Class for the pre-process of the multi-event file
+    Class for the pre-process of the multi-event file.
+    This version saves both 'base_relevance' and 'adjusted_score' for evaluation.
     """
     def __init__(self, con: duckdb.DuckDBPyConnection, config: Config):
         """

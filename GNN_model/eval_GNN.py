@@ -34,18 +34,26 @@ class GNNEvaluator:
         self._load_and_process_ground_truth()
 
     def _load_and_process_ground_truth(self):
-        """Load the pre-computed scores AND pre-process into a dict."""
+        """
+        UNIFIED (Request 4): Load the pre-computed scores
+        (both adjusted_score and base_relevance)
+        and pre-process into a dict.
+        """
         df = pd.read_parquet(self.scores_path)
+        # We expect columns 'user_id', 'item_id', 'adjusted_score', 'base_relevance', 'seen_in_train'
         df = df.rename(columns={"user_id": "user_idx", "item_id": "item_idx"})
 
         # Create a fast lookup dictionary for ground truth
         self.ground_truth = {}
 
         # Group by user_idx
-        for uid, group in df.groupby('user_idx'):  # <-- REMOVED tqdm
+        for uid, group in df.groupby('user_idx'):
             self.ground_truth[uid] = {
                 "item_idx": group["item_idx"].values,  # Original item IDs
-                "adjusted_score": group["adjusted_score"].values,
+                # --- UNIFIED (Request 4): Load both scores ---
+                "adjusted_score": group["adjusted_score"].values, # Novelty-adjusted
+                "base_relevance": group["base_relevance"].values, # Raw relevance
+                # --- END UNIFIED ---
                 "seen_in_train": group["seen_in_train"].values.astype(bool)
             }
 
@@ -58,7 +66,7 @@ class GNNEvaluator:
         """
         if self._cached_embeddings is None:
             # --- REVERTED TO CPU FORWARD PASS ---
-            # Move model to CPU temporarily
+            # This is compatible with the CPU-based training loop
             self.model.to('cpu')
             self.model.eval()
             with torch.no_grad():
@@ -67,7 +75,7 @@ class GNNEvaluator:
                 # Cache them on the CPU
                 self._cached_embeddings = (user_emb_cpu.cpu(), item_emb_cpu.cpu())
 
-            # Move model back to GPU for training
+            # Move model back to GPU for training (if it was there)
             self.model.to(self.device)
             # --- END REVERT ---
 
@@ -89,7 +97,7 @@ class GNNEvaluator:
         in the ground truth dict to the model's graph indices.
         This is done once to avoid repeated .map() calls.
         """
-        for uid in self.eval_user_indices:  # <-- REMOVED tqdm
+        for uid in self.eval_user_indices:
             gt = self.ground_truth[uid]
             orig_ids = gt["item_idx"]
 
@@ -104,7 +112,10 @@ class GNNEvaluator:
 
             # Store the mapped and filtered ground truth
             gt["graph_idx"] = np.array(graph_indices, dtype=np.int64)
+            # --- UNIFIED (Request 4): Store both scores ---
             gt["valid_adj_scores"] = gt["adjusted_score"][valid_indices]
+            gt["valid_base_rel"] = gt["base_relevance"][valid_indices]
+            # --- END UNIFIED ---
             gt["valid_seen"] = gt["seen_in_train"][valid_indices]
 
     def evaluate(self) -> Dict[str, float]:
@@ -127,6 +138,9 @@ class GNNEvaluator:
         # 3. Initialize metrics
         metrics = {
             "ndcg@k": [],
+            # --- UNIFIED (Request 4): Add raw ndcg metric ---
+            "ndcg_raw@k": [],
+            # --- END UNIFIED ---
             "hit_like@k": [],
             "hit_like_listen@k": [],
             "auc": [],
@@ -135,7 +149,7 @@ class GNNEvaluator:
         }
 
         # 4. Process users in batches
-        for i in range(0, len(self.eval_user_indices), self.eval_batch_size):  # <-- REMOVED tqdm
+        for i in range(0, len(self.eval_user_indices), self.eval_batch_size):
             # Get user indices for this batch
             batch_user_indices = self.eval_user_indices[i: i + self.eval_batch_size]
 
@@ -163,10 +177,12 @@ class GNNEvaluator:
                 # Get pre-processed ground truth
                 gt = self.ground_truth[user_idx]
                 gt_items = gt["graph_idx"]  # Already mapped
-                gt_adj = gt["valid_adj_scores"]  # Already filtered
+                # --- UNIFIED (Request 4): Get both scores ---
+                gt_adj = gt["valid_adj_scores"]  # Already filtered (novelty-adjusted)
+                gt_base_rel = gt["valid_base_rel"]  # Already filtered (raw)
+                # --- END UNIFIED ---
 
-                # --- NDCG@k (graded) ---
-                # Build a sparse relevance vector for this user
+                # --- NDCG@k (graded, based on adjusted_score) ---
                 relevance = np.zeros(self.num_items, dtype=float)
                 relevance[gt_items] = gt_adj
 
@@ -177,6 +193,18 @@ class GNNEvaluator:
                 ndcg = dcg / (idcg if idcg > 0 else 1.0)
                 metrics["ndcg@k"].append(ndcg)
 
+                # --- UNIFIED (Request 4): Calculate Raw NDCG@k (graded, based on base_relevance) ---
+                relevance_raw = np.zeros(self.num_items, dtype=float)
+                relevance_raw[gt_items] = gt_base_rel  # Use base_relevance
+
+                top_rel_raw = relevance_raw[topk_idx]
+                dcg_raw = np.sum(top_rel_raw / np.log2(np.arange(2, k + 2)))
+                ideal_raw = np.sort(np.maximum(gt_base_rel, 0))[::-1][:k]
+                idcg_raw = np.sum(ideal_raw / np.log2(np.arange(2, len(ideal_raw) + 2)))
+                ndcg_raw = dcg_raw / (idcg_raw if idcg_raw > 0 else 1.0)
+                metrics["ndcg_raw@k"].append(ndcg_raw)
+                # --- END UNIFIED ---
+
                 # --- Hit@k (like-equivalent) ---
                 like_items = gt_items[gt_adj > 1.0]  # >1 ≈ explicit like
                 metrics["hit_like@k"].append(float(len(set(like_items) & topk_set) > 0))
@@ -186,6 +214,7 @@ class GNNEvaluator:
                 metrics["hit_like_listen@k"].append(float(len(set(pos_items) & topk_set) > 0))
 
                 # --- AUC (pos vs neg) ---
+                # Use adjusted score for AUC calculation
                 pos_items_auc = gt_items[gt_adj > 0]
                 neg_items_auc = gt_items[gt_adj < 0]
 

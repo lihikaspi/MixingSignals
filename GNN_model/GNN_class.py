@@ -46,10 +46,6 @@ def print_model_info(model):
     print("-----------------------------------")
 
 
-# --- REMOVED EdgeWeightMLP ---
-# We are simplifying the model to use static weights.
-
-
 class LightGCN(nn.Module):
     def __init__(self, data: HeteroData, config: Config):
         print('>>> starting GNN init')
@@ -97,6 +93,12 @@ class LightGCN(nn.Module):
 
         self.audio_proj = None  # Set to None to save memory
 
+        # --- UNIFIED (Request 3): Add projection layer for concatenated item embeddings ---
+        # Input dim is embed_dim (audio) + embed_dim (metadata) = embed_dim * 2
+        # Output dim is embed_dim
+        self.item_project = nn.Linear(self.embed_dim * 2, self.embed_dim)
+        # --- END UNIFIED ---
+
         # Edge features
         # --- MODIFICATION: Create Homogeneous Edge Index ---
         edge_index_bipartite = data['user', 'interacts', 'item'].edge_index.cpu()
@@ -142,10 +144,10 @@ class LightGCN(nn.Module):
 
     def _get_item_embeddings(self, item_nodes, device):
         """
-        Combine audio + metadata embeddings with fixed scaling.
+        UNIFIED (Request 3): Combine audio + metadata embeddings
+        using Concat + Linear Projection.
+
         This function expects `item_nodes` to be on the *target device*.
-        It also assumes the model's embedding parameters
-        (artist_emb, album_emb) have been moved to that device.
         """
         # `item_nodes` is already on the target device.
         # We need to get the corresponding IDs from the CPU buffers.
@@ -157,17 +159,20 @@ class LightGCN(nn.Module):
         album_ids_batch = self.album_ids[item_nodes_cpu].to(device)
 
         if self.audio_proj is not None:
-            # audio_proj would also need to be .to(device)
             item_audio = self.audio_proj(item_audio)
 
-        # Get embeddings (this will be fast if device is GPU)
         artist_emb = self.artist_emb(artist_ids_batch)
         album_emb = self.album_emb(album_ids_batch)
 
         audio_part = item_audio * self.audio_scale
         metadata_part = (artist_emb + album_emb) * self.metadata_scale
 
-        item_embed = audio_part + metadata_part
+        # --- UNIFIED (Request 3): Concatenate and project ---
+        item_embed = torch.cat([audio_part, metadata_part], dim=-1)
+        # Move project layer to the correct device
+        item_embed = self.item_project.to(device)(item_embed)
+        # --- END UNIFIED ---
+
         item_embed = F.normalize(item_embed, p=2, dim=-1, eps=1e-12)
 
         return item_embed
@@ -231,14 +236,24 @@ class LightGCN(nn.Module):
         # The model's parameters (e.g., user_emb) should be on the CPU,
         # as set by the GNNTrainer.
         model_device = next(self.parameters()).device
+        if model_device != cpu_device:
+            print(
+                f"    > forward_cpu: Warning: Model parameters are on {model_device}, expected {cpu_device}. Moving to CPU.")
+            self.to(cpu_device)
+            model_device = cpu_device
 
         # We will try to use a GPU *just* for the L0 item embedding calc.
         gpu_device = None
         if torch.cuda.is_available():
-            gpu_device = torch.device(self.config.gnn.device)  # e.g., 'cuda:0'
-            print(f"    > forward_cpu: Found GPU. Accelerating L0 item embedding creation on {gpu_device}.")
+            try:
+                gpu_device = torch.device(self.config.gnn.device)  # e.g., 'cuda:0'
+                print(f"    > forward_cpu: Found GPU. Accelerating L0 embedding creation on {gpu_device}.")
+            except Exception as e:
+                print(
+                    f"    > forward_cpu: Error setting GPU device {self.config.gnn.device}: {e}. Falling back to CPU.")
+                gpu_device = cpu_device
         else:
-            print("    > forward_cpu: No GPU found. Running L0 item embedding creation on CPU.")
+            print("    > forward_cpu: No GPU found. Running L0 embedding creation on CPU.")
             gpu_device = cpu_device  # Fallback to CPU
 
         # --- 2. Get edge data (all on CPU) ---
@@ -249,18 +264,28 @@ class LightGCN(nn.Module):
             edge_index_cpu, edge_weight_cpu, fill_value=1.0, num_nodes=self.num_nodes_total
         )
 
-        # --- 3. Get L0 User Embeddings (on CPU) ---
-        user_embed = F.normalize(self.user_emb.weight.to(cpu_device), p=2, dim=-1, eps=1e-12)
+        # --- 3. Get L0 User Embeddings (Hybrid CPU/GPU) ---
+        # --- MODIFIED: Offload user norm to GPU if available ---
+        print("    > forward_cpu: Normalizing L0 User Embeddings...")
+        user_emb_gpu = self.user_emb.weight.to(gpu_device)
+        user_embed_gpu_norm = F.normalize(user_emb_gpu, p=2, dim=-1, eps=1e-12)
+        user_embed = user_embed_gpu_norm.to(cpu_device)
+        del user_emb_gpu, user_embed_gpu_norm  # Free VRAM
+        if gpu_device != cpu_device:
+            torch.cuda.empty_cache()
+        print("    > forward_cpu: L0 User Embeddings complete.")
+        # --- END MODIFIED ---
 
         # --- 4. Get L0 Item Embeddings (Hybrid CPU/GPU) ---
-
+        print("    > forward_cpu: Calculating L0 Item Embeddings (Hybrid)...")
         # Move relevant parameters *temporarily* to the GPU (if available)
         self.artist_emb.to(gpu_device)
         self.album_emb.to(gpu_device)
+        self.item_project.to(gpu_device)  # UNIFIED (Request 3)
         if self.audio_proj is not None:
             self.audio_proj.to(gpu_device)
 
-        batch_size = 10000  # Your original batch size
+        batch_size = 10000
         item_embeds_cpu_list = []
 
         # We iterate over items, compute embeddings on GPU, move back to CPU
@@ -279,27 +304,36 @@ class LightGCN(nn.Module):
         # Move parameters *back to the model's original device* (CPU)
         self.artist_emb.to(model_device)
         self.album_emb.to(model_device)
+        self.item_project.to(model_device)  # UNIFIED (Request 3)
         if self.audio_proj is not None:
             self.audio_proj.to(model_device)
-        if torch.cuda.is_available():
+        if gpu_device != cpu_device:
             torch.cuda.empty_cache()  # Clean up VRAM
 
         # Concatenate all CPU batches
         item_embed = torch.cat(item_embeds_cpu_list, dim=0)
         del item_embeds_cpu_list  # Free memory
+        print("    > forward_cpu: L0 Item Embeddings complete.")
 
         # --- 5. Concatenate L0 Embeddings (on CPU) ---
         x = torch.cat([user_embed, item_embed], dim=0)
         del user_embed, item_embed
 
         # --- 6. Run GNN Propagation (on CPU) ---
+        print("    > forward_cpu: Starting GNN propagation on CPU...")
         all_emb_sum = x
 
         for i, conv in enumerate(self.convs):
+            print(f"    > forward_cpu: GNN Layer {i + 1}/{self.num_layers}...")
             # This is the slow part that runs on CPU (as intended)
             x = conv(x, edge_index_with_loops, edge_weight=edge_weight_with_loops)
             all_emb_sum = all_emb_sum + x
 
+        print("    > forward_cpu: GNN propagation complete.")
+
+        # --- 7. Final Aggregation & Normalization (on CPU) ---
+        # Stays on CPU to avoid massive H2D/D2H copies
+        print("    > forward_cpu: Final aggregation and normalization on CPU...")
         x = all_emb_sum / (self.num_layers + 1)
         del all_emb_sum
 
@@ -310,12 +344,14 @@ class LightGCN(nn.Module):
 
         align_loss_placeholder = torch.tensor(0.0, device=cpu_device)
 
+        print("    > forward_cpu: Complete.")
         return user_emb, item_emb, align_loss_placeholder
 
     def forward_subgraph(self, batch_nodes, edge_index_sub, edge_weight_init_sub):
         """
         Forward pass on a subgraph with proper embedding combination.
-        (Not used in the new CPU-based training loop, but kept for completeness)
+        (Not used in the CPU-based training loop, but kept for completeness
+         and potential future use)
         """
         device = next(self.parameters()).device
 
