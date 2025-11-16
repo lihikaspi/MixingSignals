@@ -220,19 +220,19 @@ class GNNConfig:
     listen_weight: float = 0.8
     neutral_neg_weight: float = 0.5
 
-    lr: float = 0.0001
+    lr: float = 0.0015
     lr_decay: float = 0.98
-    momentum: float = 0.0
+    momentum: float = 0.9
     max_grad_norm: float = 1.0
     init_std: float = 0.005
 
     num_epochs: int = 50
-    batch_size: int = 32
+    batch_size: int = 256
     weight_decay: float = 1e-5
-    num_workers: int = 16
+    num_workers: int = 8
     eval_every: int = 5
     neg_samples_per_pos: int = 4
-    accum_steps: int = 2
+    accum_steps: int = 1
     audio_scale: float = 0.5
     metadata_scale: float = 30.0
     dropout: float = 0.0

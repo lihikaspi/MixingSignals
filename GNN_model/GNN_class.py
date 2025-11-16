@@ -222,11 +222,6 @@ class LightGCN(nn.Module):
     def forward_cpu(self):
         """
         Performs the full-graph forward pass with GNN propagation on CPU.
-
-        --- HYBRID OPTIMIZATION ---
-        If a GPU is available, it will be used to accelerate the
-        L0 item embedding creation (which is computationally heavy) in batches.
-        The main GNN propagation (memory heavy) will still run on the CPU.
         """
 
         # --- 1. Set up devices ---
@@ -242,19 +237,28 @@ class LightGCN(nn.Module):
             self.to(cpu_device)
             model_device = cpu_device
 
-        # We will try to use a GPU *just* for the L0 item embedding calc.
-        gpu_device = None
-        if torch.cuda.is_available():
-            try:
-                gpu_device = torch.device(self.config.gnn.device)  # e.g., 'cuda:0'
-                print(f"    > forward_cpu: Found GPU. Accelerating L0 embedding creation on {gpu_device}.")
-            except Exception as e:
-                print(
-                    f"    > forward_cpu: Error setting GPU device {self.config.gnn.device}: {e}. Falling back to CPU.")
-                gpu_device = cpu_device
-        else:
-            print("    > forward_cpu: No GPU found. Running L0 embedding creation on CPU.")
-            gpu_device = cpu_device  # Fallback to CPU
+        # --- OOM HOTFIX ---
+        # The hybrid GPU acceleration is incompatible with the retain_graph=True
+        # training loop. The entire graph MUST live on the CPU.
+        # We now force the "gpu_device" (used for L0 embs) to be the "cpu_device".
+
+        gpu_device = cpu_device  # Force CPU
+        print(f"    > forward_cpu: Forcing L0 embedding creation to CPU to prevent OOM.")
+
+        # --- OLD HYBRID LOGIC (DISABLED) ---
+        # gpu_device = None
+        # if torch.cuda.is_available():
+        #     try:
+        #         gpu_device = torch.device(self.config.gnn.device)  # e.g., 'cuda:0'
+        #         print(f"    > forward_cpu: Found GPU. Accelerating L0 embedding creation on {gpu_device}.")
+        #     except Exception as e:
+        #         print(
+        #             f"    > forward_cpu: Error setting GPU device {self.config.gnn.device}: {e}. Falling back to CPU.")
+        #         gpu_device = cpu_device
+        # else:
+        #     print("    > forward_cpu: No GPU found. Running L0 embedding creation on CPU.")
+        #     gpu_device = cpu_device  # Fallback to CPU
+        # --- END OOM HOTFIX ---
 
         # --- 2. Get edge data (all on CPU) ---
         edge_weight_cpu = self.edge_weight_init.to(cpu_device)
@@ -267,6 +271,7 @@ class LightGCN(nn.Module):
         # --- 3. Get L0 User Embeddings (Hybrid CPU/GPU) ---
         # --- MODIFIED: Offload user norm to GPU if available ---
         print("    > forward_cpu: Normalizing L0 User Embeddings...")
+        # This will use the CPU (since gpu_device == cpu_device)
         user_emb_gpu = self.user_emb.weight.to(gpu_device)
         user_embed_gpu_norm = F.normalize(user_emb_gpu, p=2, dim=-1, eps=1e-12)
         user_embed = user_embed_gpu_norm.to(cpu_device)
@@ -293,9 +298,11 @@ class LightGCN(nn.Module):
             end_idx = min(i + batch_size, self.num_items)
 
             # Create the batch of node indices *on the GPU*
+            # This will use the CPU (since gpu_device == cpu_device)
             batch_item_nodes_gpu = torch.arange(i, end_idx, device=gpu_device)
 
             # This calculation now runs on the GPU
+            # This will use the CPU (since gpu_device == cpu_device)
             item_embed_batch_gpu = self._get_item_embeddings(batch_item_nodes_gpu, gpu_device)
 
             # Move the result *back to the CPU*

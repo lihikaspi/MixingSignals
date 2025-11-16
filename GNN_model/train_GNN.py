@@ -283,7 +283,7 @@ class GNNTrainer:
             collate_fn=collate_bpr_advanced,  # Use the new collate fn
             pin_memory=pin_memory,
             persistent_workers=True if config.gnn.num_workers > 0 else False,
-            drop_last=True
+            drop_last=False
         )
         # --- END DATALOADER ---
 
@@ -365,9 +365,11 @@ class GNNTrainer:
 
             # --- UNIFIED (Request 1): EPOCH-LEVEL FORWARD PASS ---
             print(f">>> Epoch {epoch}: Running full-graph CPU forward pass...")
-            with torch.no_grad():  # No gradients needed for this part
-                # This calls the GNN-propagation
-                all_user_embs_final, all_item_embs_final, _ = self.model.forward_cpu()
+
+            # REMOVED the `with torch.no_grad():` block.
+            # This forward pass MUST track gradients.
+            all_user_embs_final, all_item_embs_final, _ = self.model.forward_cpu()
+
             print(f">>> CPU forward pass complete. Starting BPR batches...")
             # all_user_embs_final and all_item_embs_final are now on CPU
             # --- END UNIFIED ---
@@ -452,7 +454,7 @@ class GNNTrainer:
                     raise ValueError("NaN/Inf in BPR loss. Stopping training.")
 
                 loss = loss / self.accum_steps
-                loss.backward()
+                loss.backward(retain_graph=True)
 
                 # --- 5. Optimizer Step ---
                 if (batch_idx + 1) % self.accum_steps == 0:
