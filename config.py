@@ -210,7 +210,7 @@ class GNNConfig:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     embed_dim: int = 128
-    num_layers: int = 3
+    num_layers: int = 2
     lambda_align: float = 0.0
     audio_lr_scale: float = 0.1
 
@@ -218,9 +218,9 @@ class GNNConfig:
     edge_mlp_input_dim: int = 4
 
     listen_weight: float = 0.8
-    neutral_neg_weight: float = 0.3
+    neutral_neg_weight: float = 0.5
 
-    lr: float = 0.001
+    lr: float = 0.0001
     lr_decay: float = 0.98
     momentum: float = 0.0
     max_grad_norm: float = 1.0
@@ -228,15 +228,15 @@ class GNNConfig:
 
     num_epochs: int = 50
     batch_size: int = 32
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-5
     num_workers: int = 16
     eval_every: int = 5
-    neg_samples_per_pos: int = 8
+    neg_samples_per_pos: int = 4
     accum_steps: int = 2
     audio_scale: float = 0.5
     metadata_scale: float = 30.0
-    dropout: float = 0.1
-    margin: float = 0.2
+    dropout: float = 0.0
+    margin: float = 0.0
 
     eval_batch_size: int = 512
 

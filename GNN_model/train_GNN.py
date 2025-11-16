@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import json
 import math
-from torch_geometric.utils import subgraph
+# from torch_geometric.utils import subgraph # No longer needed for training
 from GNN_model.GNN_class import LightGCN
 from GNN_model.eval_GNN import GNNEvaluator
 from config import Config
@@ -196,13 +196,24 @@ def collate_bpr_advanced(batch):
 class GNNTrainer:
     """
     Trainer for BPR loss, compatible with the *current* GNN_class.py (homogeneous graph, no EdgeWeightMLP).
+
+    --- MODIFIED FOR CPU-ONLY TRAINING ---
+    This trainer now forces the model and graph to the CPU to avoid OOM errors.
+    It performs one slow, full-graph `forward_cpu()` pass at the start of each epoch
+    and then calculates BPR loss in batches using the pre-computed CPU embeddings.
     """
 
     def __init__(self, model: LightGCN, train_graph, config: Config):
         self.config = config
-        self.device = config.gnn.device
+
+        # --- CPU-ONLY FIX ---
+        # Force to CPU to avoid OOM errors on the full-graph pass
+        self.device = torch.device('cpu')
+        print(f"--- GNNTrainer: Forcing all training to CPU to avoid OOM. ---")
         self.model = model.to(self.device)
-        self.train_graph = train_graph
+        self.train_graph = train_graph.to(self.device)
+        # --- END FIX ---
+
         self.batch_size = config.gnn.batch_size
         self.num_epochs = config.gnn.num_epochs
         self.save_path = config.paths.trained_gnn
@@ -255,7 +266,8 @@ class GNNTrainer:
         self.total_nodes = self.num_users + self.num_items
 
         # --- DATALOADER ---
-        pin_memory = 'cuda' in str(self.device)
+        # pin_memory = 'cuda' in str(self.device) # <-- Cannot pin memory for CPU
+        pin_memory = False
         self.loader = DataLoader(
             self.dataset,
             batch_size=self.batch_size,
@@ -328,9 +340,9 @@ class GNNTrainer:
                 param.data.add_(grad, alpha=-param_lr)
 
     def train(self, trial=False):
-        print(f">>> starting training with ADVANCED BPR ranking loss")
+        print(f">>> starting training with ADVANCED BPR ranking loss (on CPU)")
         os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-        self.model.to(self.device)
+        self.model.to(self.device)  # Ensure model is on CPU
 
         patience = 0
         max_patience = 10
@@ -344,6 +356,14 @@ class GNNTrainer:
 
             current_lr = self._get_lr(epoch)
 
+            # --- CPU-ONLY FIX: EPOCH-LEVEL FORWARD PASS ---
+            print(f">>> Epoch {epoch}: Running full-graph CPU forward pass...")
+            with torch.no_grad():  # No gradients needed for this part
+                all_user_embs_final, all_item_embs_final, _ = self.model.forward_cpu()
+            print(f">>> CPU forward pass complete. Starting BPR batches...")
+            # all_user_embs_final and all_item_embs_final are now on CPU
+            # --- END FIX ---
+
             progress = tqdm(self.loader, desc=f"Epoch {epoch} (LR={current_lr:.6f})", leave=True)
 
             for batch_idx, batch in enumerate(progress):
@@ -352,64 +372,27 @@ class GNNTrainer:
                  i_neg_idx_tensor, i_neg_audio_embeds_tensor, i_neg_is_cold_start_tensor,
                  pos_weights, neg_weights) = batch
 
-                # --- 2. Build Subgraph (UPDATED) ---
-                batch_nodes_set = set(u_idx.numpy())
-                batch_nodes_set.update(i_pos_idx.numpy() + self.num_users)
+                # --- 2. Build Subgraph (REMOVED) ---
+                # All subgraph logic is removed, as we now use the pre-computed embeddings
 
-                # Only add in-graph negatives (idx >= 0)
-                in_graph_negs = i_neg_idx_tensor[i_neg_idx_tensor >= 0]
-                if in_graph_negs.numel() > 0:
-                    batch_nodes_set.update(in_graph_negs.numpy().flatten() + self.num_users)
-
-                batch_nodes = torch.tensor(list(batch_nodes_set), device='cpu')
-
-                edge_index_sub, edge_weight_sub = subgraph(
-                    batch_nodes,
-                    self.edge_index_full,
-                    edge_attr=self.edge_weight_full,
-                    relabel_nodes=True,
-                    num_nodes=self.total_nodes
-                )
-
-                # --- [ NEW ] ADD EDGE DROPOUT (TRAIN-ONLY) ---
-                # if self.model.training:
-                #     dropout_rate = self.dropout
-                #     keep_mask = (torch.rand(edge_index_sub.size(1), device=edge_index_sub.device) > dropout_rate)
-                #     edge_index_sub = edge_index_sub[:, keep_mask]
-                #     edge_weight_sub = edge_weight_sub[keep_mask]
-                # --- [ END NEW ] ---
-
-                # Move subgraph data to device
-                batch_nodes = batch_nodes.to(self.device)
-                edge_index_sub = edge_index_sub.to(self.device)
-                edge_weight_sub = edge_weight_sub.to(self.device)
-
-                # --- 3. Forward Pass ---
-                x_sub, _, _ = self.model.forward_subgraph(
-                    batch_nodes,
-                    edge_index_sub,
-                    edge_weight_sub
-                )
+                # --- 3. Forward Pass (REMOVED) ---
+                # We no longer call forward_subgraph
 
                 # --- 4. Map nodes and Calculate BPR Loss (HEAVILY UPDATED) ---
-                node_map = torch.full((int(batch_nodes.max()) + 1,), -1, device=self.device)
-                node_map[batch_nodes] = torch.arange(len(batch_nodes), device=self.device)
 
-                # Move all batch tensors to device
-                u_idx_gpu = u_idx.to(self.device)
-                i_pos_idx_gpu = i_pos_idx.to(self.device)
-                i_neg_idx_gpu = i_neg_idx_tensor.to(self.device)
-                neg_audio_embeds_gpu = i_neg_audio_embeds_tensor.to(self.device)
-                neg_is_cold_start_gpu = i_neg_is_cold_start_tensor.to(self.device)
-                pos_weights_gpu = pos_weights.to(self.device)
-                neg_weights_gpu = neg_weights.to(self.device)
+                # Move all batch tensors to device (which is CPU)
+                u_idx_batch = u_idx.to(self.device)
+                i_pos_idx_batch = i_pos_idx.to(self.device)
+                i_neg_idx_batch = i_neg_idx_tensor.to(self.device)
+                neg_audio_embeds_batch = i_neg_audio_embeds_tensor.to(self.device)
+                neg_is_cold_start_batch = i_neg_is_cold_start_tensor.to(self.device)
+                pos_weights_batch = pos_weights.to(self.device)
+                neg_weights_batch = neg_weights.to(self.device)
 
                 # --- Get Positive Embeddings ---
-                u_sub_idx = node_map[u_idx_gpu]
-                pos_i_sub_idx = node_map[i_pos_idx_gpu + self.num_users]
-
-                u_emb = x_sub[u_sub_idx]  # [B, D]
-                pos_i_emb = x_sub[pos_i_sub_idx]  # [B, D]
+                # We lookup from the pre-computed full-graph embeddings
+                u_emb = all_user_embs_final[u_idx_batch]  # [B, D]
+                pos_i_emb = all_item_embs_final[i_pos_idx_batch]  # [B, D]
 
                 # --- Get Negative Embeddings (All 3 Cases) ---
                 neg_i_emb = torch.zeros(
@@ -421,38 +404,17 @@ class GNNTrainer:
 
                 # Case 3: Cold-Start (Not in graph)
                 # Use pre-computed audio embedding
-                neg_i_emb[neg_is_cold_start_gpu] = neg_audio_embeds_gpu[neg_is_cold_start_gpu]
+                neg_i_emb[neg_is_cold_start_batch] = neg_audio_embeds_batch[neg_is_cold_start_batch]
 
                 # --- Handle In-Graph Negatives (Case 1 & 2) ---
-                in_graph_mask = ~neg_is_cold_start_gpu
-                in_graph_nodes_flat = i_neg_idx_gpu[in_graph_mask]  # 1D tensor of in-graph node indices
+                # This logic is now much simpler.
+                in_graph_mask = ~neg_is_cold_start_batch
+                in_graph_nodes_flat = i_neg_idx_batch[in_graph_mask]  # 1D tensor of in-graph node indices
 
                 if in_graph_nodes_flat.numel() > 0:
-                    # Map all in-graph nodes to their subgraph index (-1 if not in subgraph)
-                    mapped_sub_idx_flat = node_map[in_graph_nodes_flat + self.num_users]
-
-                    in_subgraph_flat_mask = (mapped_sub_idx_flat != -1)
-                    not_in_subgraph_flat_mask = ~in_subgraph_flat_mask
-
-                    # Initialize embeds for all in-graph negatives
-                    in_graph_embeds_flat = torch.zeros(
-                        in_graph_nodes_flat.numel(),
-                        self.embed_dim,
-                        device=self.device
-                    )
-
-                    # Case 1: In Subgraph
-                    # Get from subgraph's final propagated embeddings (x_sub)
-                    nodes_from_xsub_idx = mapped_sub_idx_flat[in_subgraph_flat_mask]
-                    if nodes_from_xsub_idx.numel() > 0:
-                        in_graph_embeds_flat[in_subgraph_flat_mask] = x_sub[nodes_from_xsub_idx]
-
-                    # Case 2: In Graph, Not in Subgraph
-                    # Get from model's initial "Level 0" item embedding
-                    nodes_from_model_idx = in_graph_nodes_flat[not_in_subgraph_flat_mask]
-                    if nodes_from_model_idx.numel() > 0:
-                        in_graph_embeds_flat[not_in_subgraph_flat_mask] = \
-                            self.model._get_item_embeddings(nodes_from_model_idx, self.device)
+                    # All in-graph nodes have a pre-computed final embedding.
+                    # We just look them up from the full item embedding table.
+                    in_graph_embeds_flat = all_item_embs_final[in_graph_nodes_flat]
 
                     # Scatter flat results back to [B, k, D] shape
                     neg_i_emb[in_graph_mask] = in_graph_embeds_flat
@@ -472,7 +434,7 @@ class GNNTrainer:
                 loss_per_neg = -F.logsigmoid(diff)  # [B, k]
 
                 # Apply weights
-                weighted_loss = loss_per_neg * pos_weights_gpu.unsqueeze(1) * neg_weights_gpu
+                weighted_loss = loss_per_neg * pos_weights_batch.unsqueeze(1) * neg_weights_batch
                 loss = weighted_loss.mean()
                 # --- End Loss Calculation ---
 
@@ -516,6 +478,7 @@ class GNNTrainer:
 
             # --- 6. Evaluation ---
             self.model.eval()
+            # GNNEvaluator already uses model.forward_cpu(), so it's compatible
             val_evaluator = GNNEvaluator(self.model, self.train_graph, "val", self.config)
             val_metrics = val_evaluator.evaluate()
             cur_ndcg = val_metrics['ndcg@k']
@@ -543,3 +506,4 @@ class GNNTrainer:
             with open(self.config.paths.val_eval, "w") as f:
                 json.dump(self.best_metrics, f, indent=4)
             print(f"Model saved to {self.save_path}")
+
