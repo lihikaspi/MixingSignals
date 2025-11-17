@@ -13,6 +13,8 @@ import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+from torch.distributed.optim import ZeroRedundancyOptimizer
+import torch.nn as nn
 import torch.multiprocessing as mp
 
 
@@ -144,7 +146,15 @@ def ddp_main(rank, world_size):
         device_id=device,
         # CPU offload is no longer needed/desired for full-GPU training
     )
-
+    
+    # --- FSDP Optimizer ---
+    fsdp_optimizer = ZeroRedundancyOptimizer(
+        model.parameters(),
+        optimizer_class=torch.optim.Adam,
+        lr=config.gnn.lr,
+        weight_decay=config.gnn.weight_decay
+    )
+    model.optimizer = fsdp_optimizer
     trainer = GNNTrainer(model, train_graph, config)
     trainer.train(trial=False)  # Run training on all GPUs
 
