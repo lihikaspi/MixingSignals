@@ -237,6 +237,7 @@ class GNNConfig:
     metadata_scale: float = 30.0
     dropout: float = 0.25
     margin: float = 0.3
+    max_patience: int = 10
 
     eval_batch_size: int = 512
 

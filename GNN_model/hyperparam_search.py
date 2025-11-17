@@ -12,7 +12,7 @@ def objective(trial):
     # --- UPDATED SEARCH RANGES BASED ON config.py ---
     try:
         # Best lr: 0.01. Range (1e-4, 5e-2) is good.
-        lr = trial.suggest_float("lr", 1e-4, 5e-2, log=True)
+        lr = trial.suggest_float("lr", 5e-3, 3e-2, log=True)
 
         # Best neg_samples_per_pos: 2. Let's search [2, 3, 4, 5, 6]
         neg_samples_per_pos = trial.suggest_int("neg_samples_per_pos", 2, 6)
@@ -33,19 +33,13 @@ def objective(trial):
         dropout = trial.suggest_float("dropout", 0.0, 0.5)
 
         # Best metadata_scale: 30.0. Let's search around it.
-        metadata_scale = trial.suggest_float("metadata_scale", 10.0, 50.0, log=True)
+        # metadata_scale = trial.suggest_float("metadata_scale", 10.0, 50.0, log=True)
 
         # Best audio_scale: 0.5. Range (0.1, 2.0) is good.
-        audio_scale = trial.suggest_float("audio_scale", 0.1, 2.0)
+        # audio_scale = trial.suggest_float("audio_scale", 0.1, 2.0)
 
         # Best margin: 0.3. Range (0.1, 0.5) is good.
         margin = trial.suggest_float("bpr_margin", 0.1, 0.5)
-
-        # --- UPDATED BATCH CONFIGURATIONS ---
-        # Best is 256_1 (total 256). Let's test totals of 256 and 512.
-        bs_config = trial.suggest_categorical("bs_config",
-                                              ["128_2", "256_1", "128_4", "256_2", "512_1"])
-        bs, accum = map(int, bs_config.split('_'))
 
         # --- APPLY ALL SUGGESTED PARAMS ---
         config.gnn.lr = lr
@@ -55,15 +49,12 @@ def objective(trial):
         config.gnn.num_layers = num_layers
         config.gnn.weight_decay = weight_decay
         config.gnn.dropout = dropout
-        config.gnn.metadata_scale = metadata_scale
-        config.gnn.audio_scale = audio_scale
+        # config.gnn.metadata_scale = metadata_scale
+        # config.gnn.audio_scale = audio_scale
         config.gnn.margin = margin  # Updated from bpr_margin
 
-        config.gnn.batch_size = bs
-        config.gnn.accum_steps = accum
-
-        config.gnn.num_epochs = 10
-        config.gnn.max_patience = 3
+        config.gnn.num_epochs = 7
+        config.gnn.max_patience = 2
 
         torch.cuda.empty_cache()
 
@@ -77,6 +68,13 @@ def objective(trial):
         trainer.train(trial=True)
 
         metric = trainer.best_ndcg
+
+	# Check if the metrics dict exists and save it
+        if hasattr(trainer, 'best_metrics'):
+            # Ensure metrics are JSON-serializable (convert tensors/numpy to float)
+            serializable_metrics = {k: (v.item() if hasattr(v, 'item') else v)
+                                    for k, v in trainer.best_metrics.items()}
+            trial.set_user_attr("best_metrics", serializable_metrics)
 
         return metric
 

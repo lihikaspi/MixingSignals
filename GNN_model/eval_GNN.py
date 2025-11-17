@@ -147,29 +147,48 @@ class GNNEvaluator:
             "dislike_fpr@k": [],
             "novelty@k": []
         }
+        
+        # --- OOM FIX: Use a smaller, OOM-safe batch size for GPU scoring ---
+        # This is much faster than 1, but much safer than 512.
+        EVAL_OOM_SAFE_BATCH_SIZE = 64 
+        # --- END FIX ---
 
         # 4. Process users in batches
+        # This outer loop still uses the config batch size, e.g., 512.
+        # It defines the "chunk" of users we process from CPU memory.
         for i in range(0, len(self.eval_user_indices), self.eval_batch_size):
-            # Get user indices for this batch
             batch_user_indices = self.eval_user_indices[i: i + self.eval_batch_size]
 
-            # --- MOVE SMALL USER BATCH TO GPU ---
-            batch_user_emb_gpu = user_emb_cpu[batch_user_indices].to(self.device)
+            # --- START OOM FIX: Re-batch the GPU work ---
+            # We have 512 user indices. Process them in mini-batches of 64 on the GPU.
+            all_batch_topk_indices_cpu = []
+            all_batch_scores_cpu = []
 
-            # --- Perform scoring for all users in batch on GPU ---
-            # (eval_batch_size, D) @ (D, num_items) -> (eval_batch_size, num_items)
-            batch_scores_gpu = torch.mm(batch_user_emb_gpu, item_emb_gpu.T)
+            for j in range(0, len(batch_user_indices), EVAL_OOM_SAFE_BATCH_SIZE):
+                mini_batch_indices = batch_user_indices[j : j + EVAL_OOM_SAFE_BATCH_SIZE]
+                
+                # Move a mini-batch of user embeddings to GPU
+                mini_batch_user_emb_gpu = user_emb_cpu[mini_batch_indices].to(self.device) # [64, D]
 
-            # --- Get Top-K on GPU ---
-            _, batch_topk_indices_gpu = torch.topk(batch_scores_gpu, k, dim=-1)
+                # --- Perform scoring for the mini-batch on GPU ---
+                # This creates a [64, 934k] tensor. Much safer.
+                mini_batch_scores_gpu = torch.mm(mini_batch_user_emb_gpu, item_emb_gpu.T)
 
-            # --- Move *only* the small results to CPU ---
-            batch_topk_indices_cpu = batch_topk_indices_gpu.cpu().numpy()
+                # --- Get Top-K on GPU ---
+                _, mini_batch_topk_indices_gpu = torch.topk(mini_batch_scores_gpu, k, dim=-1)
 
-            # We need the full score list for AUC, so move that too.
-            batch_scores_cpu = batch_scores_gpu.cpu().numpy()
+                # --- Move results to CPU and append ---
+                all_batch_topk_indices_cpu.append(mini_batch_topk_indices_gpu.cpu().numpy())
+                all_batch_scores_cpu.append(mini_batch_scores_gpu.cpu().numpy())
+
+            # Now combine the results from all mini-batches
+            batch_topk_indices_cpu = np.concatenate(all_batch_topk_indices_cpu, axis=0)
+            batch_scores_cpu = np.concatenate(all_batch_scores_cpu, axis=0)
+            # --- END OOM FIX ---
+
 
             # 5. Calculate metrics for each user in the batch (on CPU)
+            # This loop now just iterates over the CPU results
             for j, user_idx in enumerate(batch_user_indices):
                 topk_idx = batch_topk_indices_cpu[j]
                 topk_set = set(topk_idx)
@@ -206,7 +225,7 @@ class GNNEvaluator:
                 # --- END UNIFIED ---
 
                 # --- Hit@k (like-equivalent) ---
-                like_items = gt_items[gt_adj > 1.0]  # >1 â‰ˆ explicit like
+                like_items = gt_items[gt_adj > 1.0]  # >1 ˜ explicit like
                 metrics["hit_like@k"].append(float(len(set(like_items) & topk_set) > 0))
 
                 # --- Hit@k (like+listen) ---
@@ -229,7 +248,7 @@ class GNNEvaluator:
 
                     y_score = np.concatenate([
                         pred_scores_user_cpu[pos_items_auc],
-                        pred_scores_user_cpu[neg_items_auc]
+                        pred_scores__cpu[neg_items_auc]
                     ])
 
                     try:

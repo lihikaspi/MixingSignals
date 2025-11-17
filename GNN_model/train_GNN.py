@@ -303,6 +303,8 @@ class GNNTrainer:
         self.warmup_steps = len(self.loader)
         self.accum_steps = config.gnn.accum_steps
 
+        self.max_patience = config.gnn.max_patience
+
         self.best_ndcg = 0.0
         self.best_metrics = None
 
@@ -352,7 +354,6 @@ class GNNTrainer:
         self.model.to(self.device)  # Ensure model is on CPU
 
         patience = 0
-        max_patience = 10
 
         for epoch in range(1, self.num_epochs + 1):
             self.model.train()
@@ -512,8 +513,8 @@ class GNNTrainer:
                     print(f"> Best model saved ({improvement:.6f})")
             else:
                 patience += 1
-                print(f"No improvement ({patience}/{max_patience})")
-                if patience >= max_patience:
+                print(f"No improvement ({patience}/{self.max_patience})")
+                if patience >= self.max_patience:
                     print(f"Early stopping at epoch {epoch}")
                     break
 
