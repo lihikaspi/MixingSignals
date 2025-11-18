@@ -17,9 +17,11 @@ def diagnose_embedding_scales(model, sample_items=100):
 
     with torch.no_grad():
         # Get raw embeddings
-        audio = model.item_audio_emb[sample_idx].to(device)
-        artist = model.artist_emb(model.artist_ids[sample_idx].to(device))
-        album = model.album_emb(model.album_ids[sample_idx].to(device))
+        embedding_layer = model.embedding_layer
+
+        audio = embedding_layer.item_audio_emb[sample_idx].to(device)
+        artist = embedding_layer.artist_emb(embedding_layer.artist_ids[sample_idx].to(device))
+        album = embedding_layer.album_emb(embedding_layer.album_ids[sample_idx].to(device))
 
         # Compute norms
         audio_norm = audio.norm(dim=-1).mean().item()

@@ -347,46 +347,51 @@ class GNNTrainer:
                  pos_weights, neg_weights) = batch
 
                 # --- 2. Build Subgraph for Training (Mini-batch GNN) ---
-                # We need a subgraph that includes all sampled users (u_idx) and their positive/negative items.
-                # Since we don't use NeighborLoader here, we construct a simple 1-layer subgraph
-                # that contains the sampled users and all items, using the full graph's edges.
 
-                # Identify all nodes involved in the batch (users and all their sampled pos/neg items)
-                # Note: This is a placeholder for a true NeighborLoader/subgraph sampling strategy,
-                # but it forces the logic into the batch loop for DDP/FSDP compatibility.
+                # 1. Collect User Indices (0 to num_users - 1)
+                user_nodes_flat = u_idx.unique()
 
-                # Homogeneous node indices for this batch
-                # All users are in the batch, all items are potentially in the batch (pos, neg, cold-start)
-
-                # Get the nodes used in this batch
-                all_nodes_flat = torch.cat([
-                    u_idx,
+                # 2. Collect Item Indices (0 to num_items - 1) and apply offset
+                # Note: i_neg_idx_tensor contains -1 for cold-start items
+                item_nodes_non_offset = torch.cat([
                     i_pos_idx,
                     i_neg_idx_tensor.flatten()
                 ]).unique()
 
                 # Filter out cold-start items (-1 index)
-                batch_nodes = all_nodes_flat[all_nodes_flat != -1]
+                item_nodes_graph_idx = item_nodes_non_offset[item_nodes_non_offset != -1]
 
-                # Create a simple, synthetic subgraph of the required nodes
-                # Since the full graph is too big, this is the most direct way to get DDP working
-                # without fully migrating to a full PyG mini-batch sampler.
+                # Apply the homogeneous offset (using the module inside FSDP)
+                item_nodes_homogeneous = item_nodes_graph_idx + self.model.module.num_users
+
+                # 3. Combine to get all homogeneous nodes involved in the batch
+                batch_nodes = torch.cat([
+                    user_nodes_flat,
+                    item_nodes_homogeneous
+                ]).unique()
 
                 # Map nodes to the new subgraph indices (0 to len(batch_nodes) - 1)
                 node_map = {node.item(): i for i, node in enumerate(batch_nodes)}
 
                 # Filter edges that are between nodes present in batch_nodes
+                # Filter the full homogeneous edge index (self.edge_index_full)
                 mask = (
                         torch.isin(self.edge_index_full[0], batch_nodes) &
-                        torch.isin(self.edge_index_full[1] - self.num_users, batch_nodes)
+                        torch.isin(self.edge_index_full[1], batch_nodes)
                 )
 
                 edge_index_sub = self.edge_index_full[:, mask]
                 edge_weight_sub = self.edge_weight_full[mask]
 
                 # Remap edges to local indices
-                src = torch.tensor([node_map[s.item()] for s in edge_index_sub[0]])
-                dst = torch.tensor([node_map[d.item()] for d in edge_index_sub[1]])
+                src_list = [node_map[s.item()] for s in edge_index_sub[0]]
+                dst_list = [node_map[d.item()] for d in edge_index_sub[1]]
+
+                # Move nodes and edges to device for the forward pass
+                batch_nodes = batch_nodes.to(self.device)
+
+                src = torch.tensor(src_list, device=self.device)
+                dst = torch.tensor(dst_list, device=self.device)
                 edge_index_sub_remapped = torch.stack([src, dst], dim=0)
 
                 # --- 3. Forward Pass (Subgraph Propagation) ---

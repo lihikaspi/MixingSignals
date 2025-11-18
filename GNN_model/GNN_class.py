@@ -7,6 +7,67 @@ from torch_geometric.utils import add_remaining_self_loops
 from config import Config
 
 
+class EmbeddingLayer(nn.Module):
+    """Encapsulates all large, trainable embedding tables."""
+    def __init__(self, num_users, embed_dim, artist_ids, album_ids, item_audio_emb, config):
+        super().__init__()
+
+        # User Embedding
+        self.user_emb = nn.Embedding(num_users, embed_dim)
+        nn.init.xavier_uniform_(self.user_emb.weight)
+
+        # Item Meta Embeddings
+        num_artists = artist_ids.max().item() + 1
+        num_albums = album_ids.max().item() + 1
+        self.artist_emb = nn.Embedding(num_artists, embed_dim)
+        self.album_emb = nn.Embedding(num_albums, embed_dim)
+        nn.init.xavier_uniform_(self.artist_emb.weight)
+        nn.init.xavier_uniform_(self.album_emb.weight)
+
+        # Projections
+        # UNIFIED (Request 3): Item projection layer
+        self.item_project = nn.Linear(embed_dim * 2, embed_dim)
+        self.audio_proj = None  # Set to None to save memory
+
+        # Scales (non-trainable, but needed for forward)
+        self.audio_scale = config.gnn.audio_scale
+        self.metadata_scale = config.gnn.metadata_scale
+
+        # Non-trainable buffers (kept on CPU/host memory)
+        self.register_buffer('item_audio_emb', item_audio_emb)
+        self.register_buffer('artist_ids', artist_ids)
+        self.register_buffer('album_ids', album_ids)
+
+    def get_user_embedding(self, user_nodes):
+        # Returns raw user embedding for normalization in LightGCN
+        return self.user_emb(user_nodes)
+
+    def get_item_embeddings(self, item_nodes, device):
+        """Combines audio and metadata embeddings using projection."""
+        item_nodes_cpu = item_nodes.cpu()
+
+        # Move required data to the target device
+        item_audio = self.item_audio_emb[item_nodes_cpu].to(device)
+        artist_ids_batch = self.artist_ids[item_nodes_cpu].to(device)
+        album_ids_batch = self.album_ids[item_nodes_cpu].to(device)
+
+        if self.audio_proj is not None:
+            item_audio = self.audio_proj(item_audio)
+
+        artist_emb = self.artist_emb(artist_ids_batch)
+        album_emb = self.album_emb(album_ids_batch)
+
+        audio_part = item_audio * self.audio_scale
+        metadata_part = (artist_emb + album_emb) * self.metadata_scale
+
+        item_embed = torch.cat([audio_part, metadata_part], dim=-1)
+        item_embed = self.item_project.to(device)(item_embed)
+
+        item_embed = F.normalize(item_embed, p=2, dim=-1, eps=1e-12)
+
+        return item_embed
+
+
 def print_model_info(model):
     """
     Prints the total number of parameters, trainable parameters,
@@ -65,38 +126,32 @@ class LightGCN(nn.Module):
 
         # --- NEW: Sanitize Audio Embeddings ---
         raw_audio_emb = data['item'].x.cpu()
-        # Check for NaNs and Infs
         if torch.isnan(raw_audio_emb).any() or torch.isinf(raw_audio_emb).any():
             print(">>> WARNING: NaNs or Infs detected in raw audio embeddings. Replacing with 0.")
-            # Replace NaNs with 0
             raw_audio_emb = torch.nan_to_num(raw_audio_emb, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Keep on CPU, move to GPU only when needed
-        self.register_buffer('item_audio_emb', raw_audio_emb)
-        # --- END SANITIZE ---
-
-        self.register_buffer('artist_ids', data['item'].artist_id.cpu())
-        self.register_buffer('album_ids', data['item'].album_id.cpu())
+        self.embedding_layer = EmbeddingLayer(
+            num_users=self.num_users,
+            embed_dim=self.embed_dim,
+            artist_ids=data['item'].artist_id.cpu(),
+            album_ids=data['item'].album_id.cpu(),
+            item_audio_emb=raw_audio_emb,
+            config=config  # Pass config to set scales and get projection layer
+        )
+        # Inherit necessary buffers for evaluation and mapping
         self.register_buffer('user_original_ids', data['user'].uid.cpu())
         self.register_buffer('item_original_ids', data['item'].item_id.cpu())
 
-        num_artists = self.artist_ids.max().item() + 1
-        num_albums = self.album_ids.max().item() + 1
-        self.artist_emb = nn.Embedding(num_artists, self.embed_dim)
-        self.album_emb = nn.Embedding(num_albums, self.embed_dim)
+        # --- Remove redundant scales, user_emb, artist_emb, album_emb, item_project, audio_scale/metadata_scale definitions here ---
 
-        nn.init.xavier_uniform_(self.artist_emb.weight)
-        nn.init.xavier_uniform_(self.album_emb.weight)
-
-        self.audio_scale = config.gnn.audio_scale
-        self.metadata_scale = config.gnn.metadata_scale
-
-        self.audio_proj = None  # Set to None to save memory
-
-        # --- UNIFIED (Request 3): Add projection layer for concatenated item embeddings ---
-        # Input dim is embed_dim (audio) + embed_dim (metadata) = embed_dim * 2
-        # Output dim is embed_dim
-        self.item_project = nn.Linear(self.embed_dim * 2, self.embed_dim)
+        # --- Update accessors to point to the new layer ---
+        self.user_emb = self.embedding_layer.user_emb  # Expose for legacy access
+        self.artist_ids = self.embedding_layer.artist_ids
+        self.album_ids = self.embedding_layer.album_ids
+        self.item_audio_emb = self.embedding_layer.item_audio_emb
+        self.item_project = self.embedding_layer.item_project
+        self.audio_scale = self.embedding_layer.audio_scale
+        self.metadata_scale = self.embedding_layer.metadata_scale
         # --- END UNIFIED ---
 
         # Edge features

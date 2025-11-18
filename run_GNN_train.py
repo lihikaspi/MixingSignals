@@ -5,14 +5,15 @@ import gc
 import json
 from torch_geometric.data import HeteroData
 from GNN_model.train_GNN import GNNTrainer
-from GNN_model.GNN_class import LightGCN
+from GNN_model.GNN_class import LightGCN, EmbeddingLayer
 from GNN_model.eval_GNN import GNNEvaluator
 from config import config
 from GNN_model.diagnostics import diagnose_embedding_scales
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy
-from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy, CPUOffload
+from torch.distributed.fsdp.wrap import wrap as fsdp_wrap
+from functools import partial
 import torch.multiprocessing as mp
 
 
@@ -136,13 +137,23 @@ def ddp_main(rank, world_size):
     model.audio_scale = broadcast_tensors[0].item()
     model.metadata_scale = broadcast_tensors[1].item()
 
+    model.to(device)
+
+    fsdp_auto_wrap_policy = partial(
+        fsdp_wrap,
+        module_to_wrap={EmbeddingLayer},
+        min_num_params=0  # Ensure wrapping occurs even if size is small, as we target by type
+    )
+
     # --- FSDP WRAPPER: The critical change for multi-GPU training ---
-    model.to(device)  # Move initial embeddings (user/item meta) to the GPU before wrapping
+      # Move initial embeddings (user/item meta) to the GPU before wrapping
     model = FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
+        # AGGRESSIVE OOM FIX: Offload parameters and optimizer state to CPU RAM
+        cpu_offload=CPUOffload(offload_params=True),
         device_id=device,
-        # CPU offload is no longer needed/desired for full-GPU training
+        auto_wrap_policy=fsdp_auto_wrap_policy
     )
 
     trainer = GNNTrainer(model, train_graph, config)
