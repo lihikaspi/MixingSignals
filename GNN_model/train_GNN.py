@@ -21,29 +21,28 @@ class BPRDataset(Dataset):
     """
 
     def __init__(self, train_graph, config: Config, raw_user2neg: dict):
-        # print(">>> Initializing Advanced BPRDataset...")
-
         # All edges are now positive in the graph
         edge_index = train_graph['user', 'interacts', 'item'].edge_index
         edge_attr = train_graph[
             'user', 'interacts', 'item'].edge_attr
 
         user_idx, item_idx = edge_index.cpu()
-        # edge_attr[:, 0] is the 'edge_type' (e.g., 1=listen, 2=like, 5=undislike)
-        edge_types = edge_attr[:, 0].cpu()
-        # UNIFIED: Get edge_avg_played_ratio (This is the hybrid weight)
-        # This is column 2 (index 2) from build_graph.py
-        edge_ratios = edge_attr[:, 2].cpu()
+
+        # --- UPDATED: Use config indices ---
+        # edge_attr columns: 0=type, 1=count, 2=ratio, 3=weight
+        idx_type = config.gnn.edge_attr_indices['type']
+        idx_ratio = config.gnn.edge_attr_indices['ratio']
+
+        edge_types = edge_attr[:, idx_type].cpu()
+        edge_ratios = edge_attr[:, idx_ratio].cpu()
 
         self.user2pos = {}
-        # UNIFIED: Store ratios instead of types
         self.user2pos_ratios = {}
-        # self.user2neg stores list of tuples: (item_train_idx, audio_embed)
         self.user2neg = {}  # For "hard" negatives (dislikes)
         self.num_items = int(train_graph['item'].num_nodes)
         self.all_users_pos_sets = defaultdict(set)  # For "easy" negative sampling
 
-        self.listen_weight = config.gnn.listen_weight  # No longer used for pos_weight
+        self.listen_weight = config.gnn.listen_weight
         self.neutral_neg_weight = config.gnn.neutral_neg_weight
         self.neg_samples_per_pos = config.gnn.neg_samples_per_pos
         self.edge_type_mapping = config.preprocessing.edge_type_mapping
@@ -52,18 +51,14 @@ class BPRDataset(Dataset):
         pos_types = [self.edge_type_mapping[k] for k in ["listen", "like", "undislike"]]
 
         # 1. Extract POSITIVE interactions from the graph
-        # print("    Building user-to-item positive map from graph...")
-        # UNIFIED: Add 'r' (ratio) to the loop
         for u, i, t, r in zip(user_idx.tolist(), item_idx.tolist(), edge_types.tolist(), edge_ratios.tolist()):
             t_int = int(round(t))
             if t_int in pos_types:
                 self.user2pos.setdefault(u, []).append(i)
-                # UNIFIED: Store the ratio
                 self.user2pos_ratios.setdefault(u, []).append(r)
                 self.all_users_pos_sets[u].add(i)  # Add to set for fast lookup
 
         # 2. Process the pre-loaded RAW hard negative map
-        # print("    Cleaning hard negative lists...")
         for u, neg_tuples in raw_user2neg.items():
             pos_set_for_user = self.all_users_pos_sets.get(u, set())
             cleaned_negs = []
@@ -89,7 +84,6 @@ class BPRDataset(Dataset):
     def __getitem__(self, idx):
         u = self.users[idx]
         pos_items = self.user2pos[u]
-        # UNIFIED: Get pos_ratios
         pos_ratios = self.user2pos_ratios[u]
 
         # Get a mutable list of hard negatives for this user
@@ -102,11 +96,9 @@ class BPRDataset(Dataset):
         i_pos_idx = np.random.randint(len(pos_items))
         i_pos = pos_items[i_pos_idx]
 
-        # --- UNIFIED (Request 2): Use the pre-computed hybrid ratio as the weight ---
-        # This ratio is 1.0 for 'like', 0.5 for 'undislike',
-        # and played_ratio_pct/100.0 for 'listen'.
+        # Use the pre-computed hybrid ratio as the weight for the loss function
+        # (Note: graph propagation uses the MLP learned weight, but loss uses this ground-truth confidence)
         pos_weight = pos_ratios[i_pos_idx]
-        # --- END UNIFIED ---
 
         # --- 2. Sample K negative items ---
         neg_graph_indices = []
@@ -207,7 +199,7 @@ class GNNTrainer:
     This trainer forces the model and graph to the CPU to avoid OOM errors.
     It performs one slow, full-graph `forward_cpu()` pass at the start of each
     epoch and then calculates BPR loss in batches using the pre-computed
-    CPU embeddings. This is the logic from the "committed" code.
+    CPU embeddings.
     """
 
     def __init__(self, model: LightGCN, train_graph, config: Config):
@@ -216,7 +208,6 @@ class GNNTrainer:
         # --- UNIFIED (Request 1): CPU-ONLY Strategy ---
         # Force to CPU to avoid OOM errors on the full-graph pass
         self.device = torch.device('cpu')
-        # print(f"--- GNNTrainer: Forcing all training to CPU to avoid OOM. ---")
         self.model = model.to(self.device)
         self.train_graph = train_graph.to(self.device)
         # --- END FIX ---
@@ -228,8 +219,6 @@ class GNNTrainer:
         self.embed_dim = config.gnn.embed_dim  # Store embed_dim
 
         # --- Load and process negative interactions ONCE ---
-        # print(">>> GNNTrainer: Building item ID to graph index map...")
-        # .cpu() is important if graph was loaded to GPU
         item_original_ids = train_graph['item'].item_id.cpu().numpy()
         item_id_to_graph_idx = {item_id: i for i, item_id in enumerate(item_original_ids)}
         del item_original_ids  # Free memory
@@ -238,33 +227,25 @@ class GNNTrainer:
 
         # 1. Load IN-GRAPH negatives (lightweight)
         in_graph_neg_file = config.paths.negative_train_in_graph_file
-        # print(f">>> GNNTrainer: Loading IN-GRAPH negatives from {in_graph_neg_file}...")
         neg_in_graph_df = pd.read_parquet(in_graph_neg_file, columns=['user_id', 'item_id'])
 
-        # print(">>> GNNTrainer: Processing IN-GRAPH negatives...")
         for row in neg_in_graph_df.itertuples(index=False):
             item_train_idx = item_id_to_graph_idx.get(row.item_id, -1)
-            # Should always be found, but check just in case
             if item_train_idx != -1:
                 raw_user2neg_map[row.user_id].append((item_train_idx, None))
         del neg_in_graph_df  # Free memory
 
         # 2. Load COLD-START negatives (heavy but smaller)
         cold_start_neg_file = config.paths.negative_train_cold_start_file
-        # print(f">>> GNNTrainer: Loading COLD-START negatives from {cold_start_neg_file}...")
         neg_cold_start_df = pd.read_parquet(cold_start_neg_file, columns=['user_id', 'normalized_embed'])
 
-        # print(">>> GNNTrainer: Processing COLD-START negatives...")
         for row in neg_cold_start_df.itertuples(index=False):
             # item_train_idx is -1, and we pass the embedding
             raw_user2neg_map[row.user_id].append((-1, row.normalized_embed))
         del neg_cold_start_df  # Free memory
-
-        # print(f">>> GNNTrainer: Loaded {len(raw_user2neg_map)} users with hard negatives.")
         # --- END NEW ---
 
         # --- UNIFIED (Request 2): Use the Advanced BPRDataset ---
-        # print(">>> GNNTrainer: Initializing BPRDataset...")
         self.dataset = BPRDataset(train_graph, config, raw_user2neg_map)
 
         # Get node counts from model and dataset
@@ -273,7 +254,6 @@ class GNNTrainer:
         self.total_nodes = self.num_users + self.num_items
 
         # --- DATALOADER ---
-        # pin_memory = 'cuda' in str(self.device) # <-- Cannot pin memory for CPU
         pin_memory = False
         self.loader = DataLoader(
             self.dataset,
@@ -286,10 +266,6 @@ class GNNTrainer:
             drop_last=False
         )
         # --- END DATALOADER ---
-
-        # Get data from the *model* buffers, which are already homogeneous
-        self.edge_index_full = self.model.edge_index.cpu()
-        self.edge_weight_full = self.model.edge_weight_init.cpu()
 
         self.lr_base = config.gnn.lr
         self.lr_decay = config.gnn.lr_decay
@@ -339,6 +315,9 @@ class GNNTrainer:
                     param_lr = lr * 1.0
                 elif 'artist_emb' in name or 'album_emb' in name:
                     param_lr = lr * 2.0
+                elif 'edge_mlp' in name:
+                    # We can detect the MLP parameters by name because it is a submodule
+                    param_lr = lr * 0.5  # Slower learning for the MLP
                 else:
                     param_lr = lr
 
@@ -347,6 +326,24 @@ class GNNTrainer:
                     grad = grad.add(param.data, alpha=self.weight_decay)
 
                 param.data.add_(grad, alpha=-param_lr)
+
+    def _calc_bpr_loss(self, u_emb, pos_i_emb, neg_i_emb, pos_weights_batch, neg_weights_batch):
+        """
+        Calculates the Weighted BPR Loss.
+        Moved to a separate function for clarity.
+        """
+        # --- Calculate Scores ---
+        pos_scores = (u_emb * pos_i_emb).sum(dim=-1, keepdim=True)  # [B, 1]
+        neg_scores = (u_emb.unsqueeze(1) * neg_i_emb).sum(dim=-1)  # [B, k]
+
+        # --- BPR Loss ---
+        diff = pos_scores - neg_scores - self.margin
+        loss_per_neg = -F.logsigmoid(diff)  # [B, k]
+
+        # --- Apply Weights ---
+        # pos_weights_batch is the continuous hybrid ratio (0.0-1.0) from edge_attr column 2
+        weighted_loss = loss_per_neg * pos_weights_batch.unsqueeze(1) * neg_weights_batch
+        return weighted_loss.mean()
 
     def train(self, trial=False):
         print(f">>> starting training with ADVANCED BPR ranking loss (on CPU)")
@@ -357,7 +354,6 @@ class GNNTrainer:
 
         for epoch in range(1, self.num_epochs + 1):
             self.model.train()
-
             self.model.to(self.device)
 
             epoch_loss = 0.0
@@ -369,8 +365,7 @@ class GNNTrainer:
             # --- UNIFIED (Request 1): EPOCH-LEVEL FORWARD PASS ---
             print(f">>> Epoch {epoch}: Running full-graph CPU forward pass...")
 
-            # REMOVED the `with torch.no_grad():` block.
-            # This forward pass MUST track gradients.
+            # The forward pass now uses the MLP to compute edge weights dynamically on the CPU
             all_user_embs_final, all_item_embs_final, _ = self.model.forward_cpu()
 
             print(f">>> CPU forward pass complete. Starting BPR batches...")
@@ -384,14 +379,6 @@ class GNNTrainer:
                 (u_idx, i_pos_idx,
                  i_neg_idx_tensor, i_neg_audio_embeds_tensor, i_neg_is_cold_start_tensor,
                  pos_weights, neg_weights) = batch
-
-                # --- 2. Build Subgraph (REMOVED) ---
-                # All subgraph logic is removed, as we now use the pre-computed embeddings
-
-                # --- 3. Forward Pass (REMOVED) ---
-                # We no longer call forward_subgraph
-
-                # --- 4. Map nodes and Calculate BPR Loss (Using pre-computed embs) ---
 
                 # Move all batch tensors to device (which is CPU)
                 u_idx_batch = u_idx.to(self.device)
@@ -421,7 +408,6 @@ class GNNTrainer:
                 neg_i_emb[neg_is_cold_start_batch] = neg_audio_embeds_batch[neg_is_cold_start_batch]
 
                 # --- Handle In-Graph Negatives (Case 1 & 2) ---
-                # This logic is now much simpler.
                 in_graph_mask = ~neg_is_cold_start_batch
                 in_graph_nodes_flat = i_neg_idx_batch[in_graph_mask]  # 1D tensor of in-graph node indices
 
@@ -441,17 +427,7 @@ class GNNTrainer:
                 # --- [ END NEW ] ---
 
                 # --- Calculate Weighted BPR Loss ---
-                pos_scores = (u_emb * pos_i_emb).sum(dim=-1, keepdim=True)  # [B, 1]
-                neg_scores = (u_emb.unsqueeze(1) * neg_i_emb).sum(dim=-1)  # [B, k]
-
-                diff = pos_scores - neg_scores - self.margin
-                loss_per_neg = -F.logsigmoid(diff)  # [B, k]
-
-                # Apply weights
-                # pos_weights_batch is now the continuous hybrid ratio (0.0-1.0)
-                weighted_loss = loss_per_neg * pos_weights_batch.unsqueeze(1) * neg_weights_batch
-                loss = weighted_loss.mean()
-                # --- End Loss Calculation ---
+                loss = self._calc_bpr_loss(u_emb, pos_i_emb, neg_i_emb, pos_weights_batch, neg_weights_batch)
 
                 if not torch.isfinite(loss):
                     print(f"\n!!! NaN/Inf detected in BPR loss at epoch {epoch}, batch {batch_idx}!!!")

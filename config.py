@@ -209,6 +209,13 @@ class PreprocessingConfig:
 class GNNConfig:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    edge_attr_indices: Dict[str, int] = field(default_factory=lambda: {
+        "type": 0,
+        "count": 1,
+        "ratio": 2,
+        "weight": 3  # The heuristic weight
+    })
+
     embed_dim: int = 128
     num_layers: int = 3
     lambda_align: float = 0.0
