@@ -12,7 +12,7 @@ def objective(trial):
     # --- UPDATED SEARCH RANGES BASED ON config.py ---
     try:
         # Best lr: 0.01. Range (1e-4, 5e-2) is good.
-        lr = trial.suggest_float("lr", 5e-3, 3e-2, log=True)
+        lr = trial.suggest_float("lr", 0.05, 0.2, log=True)
 
         # Best neg_samples_per_pos: 2. Let's search [2, 3, 4, 5, 6]
         neg_samples_per_pos = trial.suggest_int("neg_samples_per_pos", 2, 6)
@@ -91,7 +91,7 @@ def objective(trial):
 def main():
     storage_url = f"sqlite:///{config.paths.eval_dir}/hp_search.db"
     # --- UPDATED STUDY NAME ---
-    study_name = "gnn_hp_search_cpu"
+    study_name = "gnn_hp_search_cpu_no_scales"
 
     study = optuna.create_study(
         storage=storage_url,
