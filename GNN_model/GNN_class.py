@@ -60,7 +60,6 @@ class LightGCN(nn.Module):
         super().__init__()
         self.config = config
         self.num_layers = config.gnn.num_layers
-        self.lambda_align = config.gnn.lambda_align
         self.embed_dim = config.gnn.embed_dim
 
         # Node counts
@@ -68,46 +67,70 @@ class LightGCN(nn.Module):
         self.num_items = data['item'].num_nodes
         self.num_nodes_total = self.num_users + self.num_items
 
+        # 1. Initialize Node Embeddings & Projections
+        self._init_node_embeddings(data)
+        # 2. Register Item Data (Audio & IDs)
+        self._register_item_data(data)
+        # 3. Initialize Edge Weight Module
+        self.edge_mlp = EdgeWeightMLP(config)
+        # 4. Build Homogeneous Graph Structure
+        self._build_homogeneous_graph(data)
+        # 5. Initialize GNN Layers
+        self.convs = nn.ModuleList([
+            LGConv(normalize=True)
+            for _ in range(self.num_layers)
+        ])
+
+        print(">>> finished GNN init")
+
+
+    def _init_node_embeddings(self, data):
+        """Initializes user, artist, and album embeddings."""
+        # User Embeddings
         self.user_emb = nn.Embedding(self.num_users, self.embed_dim)
         nn.init.xavier_uniform_(self.user_emb.weight)
 
-        # --- Sanitize Audio Embeddings ---
-        raw_audio_emb = data['item'].x.cpu()
-        if torch.isnan(raw_audio_emb).any() or torch.isinf(raw_audio_emb).any():
-            print(">>> WARNING: NaNs or Infs detected in raw audio embeddings. Replacing with 0.")
-            raw_audio_emb = torch.nan_to_num(raw_audio_emb, nan=0.0, posinf=0.0, neginf=0.0)
+        # Metadata Embeddings
+        # Note: We need to access max IDs from data to size the embeddings
+        # Using CPU to avoid GPU sync/OOM during init if graph is huge
+        artist_ids = data['item'].artist_id.cpu()
+        album_ids = data['item'].album_id.cpu()
 
-        self.register_buffer('item_audio_emb', raw_audio_emb)
+        num_artists = artist_ids.max().item() + 1
+        num_albums = album_ids.max().item() + 1
 
-        self.register_buffer('artist_ids', data['item'].artist_id.cpu())
-        self.register_buffer('album_ids', data['item'].album_id.cpu())
-        self.register_buffer('user_original_ids', data['user'].uid.cpu())
-        self.register_buffer('item_original_ids', data['item'].item_id.cpu())
-
-        num_artists = self.artist_ids.max().item() + 1
-        num_albums = self.album_ids.max().item() + 1
         self.artist_emb = nn.Embedding(num_artists, self.embed_dim)
         self.album_emb = nn.Embedding(num_albums, self.embed_dim)
 
         nn.init.xavier_uniform_(self.artist_emb.weight)
         nn.init.xavier_uniform_(self.album_emb.weight)
 
-        self.audio_scale = config.gnn.audio_scale
-        self.metadata_scale = config.gnn.metadata_scale
-
-        self.audio_proj = None  # Set to None to save memory
-
-        # --- Projection layer for concatenated item embeddings ---
+        # Projections & Scales
+        self.audio_scale = self.config.gnn.audio_scale
+        self.metadata_scale = self.config.gnn.metadata_scale
+        self.audio_proj = None
         self.item_project = nn.Linear(self.embed_dim * 2, self.embed_dim)
 
-        # --- EDGE WEIGHT MLP (Refactored) ---
-        # Initialize the separate class
-        # This will reside on CPU by default until moved
-        self.edge_mlp = EdgeWeightMLP(config)
 
+    def _register_item_data(self, data):
+        """Registers item-related static tensors as buffers."""
+        # Sanitize Audio Embeddings
+        raw_audio_emb = data['item'].x.cpu()
+        if torch.isnan(raw_audio_emb).any() or torch.isinf(raw_audio_emb).any():
+            print(">>> WARNING: NaNs or Infs detected in raw audio embeddings. Replacing with 0.")
+            raw_audio_emb = torch.nan_to_num(raw_audio_emb, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self.register_buffer('item_audio_emb', raw_audio_emb)
+        self.register_buffer('artist_ids', data['item'].artist_id.cpu())
+        self.register_buffer('album_ids', data['item'].album_id.cpu())
+        self.register_buffer('user_original_ids', data['user'].uid.cpu())
+        self.register_buffer('item_original_ids', data['item'].item_id.cpu())
+
+
+    def _build_homogeneous_graph(self, data):
+        """Converts bipartite edge index/attr to homogeneous structure."""
         # Edge features
         edge_index_bipartite = data['user', 'interacts', 'item'].edge_index.cpu()
-        # Get the combined edge attributes (type, count, ratio, weight)
         edge_attr_bipartite = data['user', 'interacts', 'item'].edge_attr.cpu()
 
         # Forward edges (user -> item)
@@ -127,13 +150,6 @@ class LightGCN(nn.Module):
         self.register_buffer('edge_index', edge_index_full_homo)
         self.register_buffer('edge_attr_init', edge_attr_full_homo)
 
-        # --- THE FIX: Enable normalization, but do NOT add self-loops here ---
-        self.convs = nn.ModuleList([
-            LGConv(normalize=True)
-            for _ in range(self.num_layers)
-        ])
-
-        print(">>> finished GNN init")
 
     def _get_item_embeddings(self, item_nodes, device):
         """
@@ -161,6 +177,7 @@ class LightGCN(nn.Module):
 
         return item_embed
 
+
     def _compute_edge_weights(self, device):
         """
         Helper to run MLP on edge attributes to get learnable weights.
@@ -178,6 +195,7 @@ class LightGCN(nn.Module):
         weights = torch.clamp(weights, min=1e-6)
 
         return weights
+
 
     def forward(self, return_projections=False):
         """
@@ -216,6 +234,7 @@ class LightGCN(nn.Module):
 
         align_loss = torch.tensor(0.0, device=device)
         return user_emb, item_emb, align_loss
+
 
     def forward_cpu(self):
         """
@@ -295,3 +314,4 @@ class LightGCN(nn.Module):
         align_loss_placeholder = torch.tensor(0.0, device=cpu_device)
 
         return user_emb, item_emb, align_loss_placeholder
+

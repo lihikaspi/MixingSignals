@@ -3,14 +3,10 @@ from config import Config
 
 class EdgeAssembler:
     """
-    Class to assemble the data for the graph construction
+    Class to assemble the data for the graph construction.
+    Refactored for modularity.
     """
     def __init__(self, con: duckdb.DuckDBPyConnection, config: Config):
-        """
-        Args:
-            con: DuckDB connection
-            config: global Config object
-        """
         self.con = con
         self.train_path = config.paths.train_set_file
         self.weights = config.preprocessing.weights
@@ -19,20 +15,32 @@ class EdgeAssembler:
         self.artist_mapping_path = config.paths.artist_mapping_file
         self.event_type_mapping = config.preprocessing.edge_type_mapping
 
+
+    def _build_weight_case_stmt(self) -> str:
+        """Constructs SQL CASE statement for edge weights."""
+        stmt = "CASE e.event_type\n"
+        for etype, weight in self.weights.items():
+            stmt += f"    WHEN '{etype}' THEN {weight}\n"
+        stmt += "END AS edge_weight"
+        return stmt
+
+
+    def _build_event_type_case_stmt(self) -> str:
+        """Constructs SQL CASE statement for numeric edge types."""
+        stmt = "CASE e.event_type\n"
+        for etype, cat in self.event_type_mapping.items():
+            stmt += f"    WHEN '{etype}' THEN {cat}\n"
+        stmt += "    ELSE 0\nEND AS edge_type"
+        return stmt
+
+
     def _aggregate_edges(self):
         """
-        Aggregates the interactions by user-song-event, adding interactions counter, event-type weights and the audio embeddings.
-        Creates a temporary table 'agg_edges' in the DuckDB memory.
+        Aggregates interactions by user-song-event.
+        Calculates counts, weights, and average play ratios.
         """
-        case_weight = "CASE e.event_type\n"
-        for etype, weight in self.weights.items():
-            case_weight += f"    WHEN '{etype}' THEN {weight}\n"
-        case_weight += "END AS edge_weight"
-
-        case_event_type = "CASE e.event_type\n"
-        for etype, cat in self.event_type_mapping.items():
-            case_event_type += f"    WHEN '{etype}' THEN {cat}\n"
-        case_event_type += "    ELSE 0\nEND AS edge_type"
+        case_weight = self._build_weight_case_stmt()
+        case_event_type = self._build_event_type_case_stmt()
 
         query = f"""
             CREATE TEMPORARY TABLE agg_edges AS
@@ -60,9 +68,7 @@ class EdgeAssembler:
 
 
     def _prepare_train_item_map(self):
-        """
-        Create a mapping from item_id to continuous train indices for items in the training set.
-        """
+        """Creates a mapping from global item_id to continuous train indices (0..N)."""
         self.con.execute(f"""
             CREATE TEMPORARY TABLE train_items AS
             SELECT DISTINCT item_id
@@ -71,8 +77,7 @@ class EdgeAssembler:
         """)
 
         self.con.execute("""
-             CREATE
-             TEMPORARY TABLE train_item_map AS
+             CREATE TEMPORARY TABLE train_item_map AS
              SELECT item_id, ROW_NUMBER() OVER (ORDER BY item_id) - 1 AS item_train_idx
              FROM train_items
         """)
@@ -80,9 +85,8 @@ class EdgeAssembler:
 
 
     def _prepare_artist_album_metadata(self):
-        """
-        Prepare artist and album metadata tables with encoded indices.
-        """
+        """Encodes artist and album IDs and prepares metadata tables."""
+        # Create simple 0-indexed tables for artists and albums
         self.con.execute(f"""
             CREATE TEMPORARY TABLE artist_index AS
             SELECT artist_id, ROW_NUMBER() OVER (ORDER BY artist_id) AS artist_idx
@@ -95,6 +99,7 @@ class EdgeAssembler:
             FROM (SELECT DISTINCT album_id FROM read_parquet('{self.album_mapping_path}'))
         """)
 
+        # Map songs to these new indices
         self.con.execute(f"""
             CREATE TEMPORARY TABLE song_artist_meta AS
             SELECT s.item_id, s.artist_id, a.artist_idx
@@ -111,13 +116,10 @@ class EdgeAssembler:
         print("Prepared artist and album metadata")
 
 
-    def _merge_edges_metadata(self):
-        """
-        Merge aggregated edges with metadata, assign train indices, and deduplicate by item_idx.
-        """
+    def _join_edges_with_metadata(self):
+        """Joins aggregated edges with the prepared metadata and train indices."""
         self.con.execute("""
-            CREATE
-            TEMPORARY TABLE merged AS
+            CREATE TEMPORARY TABLE merged_raw AS
             SELECT ae.item_id,
                 COALESCE(tm.item_train_idx, -1) AS item_train_idx,
                 ae.item_normalized_embed,
@@ -131,9 +133,15 @@ class EdgeAssembler:
                 LEFT JOIN train_item_map tm ON ae.item_id = tm.item_id
         """)
 
+
+    def _deduplicate_metadata(self):
+        """
+        Deduplicates metadata.
+        Since edges are user-song-event specific, the metadata (artist/album)
+        should be constant per song. We group by item_id to ensure unique metadata per item.
+        """
         self.con.execute("""
-            CREATE
-            TEMPORARY TABLE agg_edges_artist_album AS
+            CREATE TEMPORARY TABLE agg_edges_artist_album AS
             SELECT 
                 item_id, item_train_idx,
                 ANY_VALUE(item_normalized_embed) AS item_normalized_embed,
@@ -141,25 +149,27 @@ class EdgeAssembler:
                 MAX(album_idx)                   AS album_idx,
                 MAX(artist_id)                   AS artist_id,
                 MAX(album_id)                    AS album_id
-            FROM merged
+            FROM merged_raw
             GROUP BY item_id, item_train_idx
         """)
         print("Merged edges and metadata, deduplicated, and re-indexed items for train")
 
 
     def _add_song_metadata(self):
+        """Coordinator for adding metadata to edges."""
         self._prepare_train_item_map()
         self._prepare_artist_album_metadata()
-        self._merge_edges_metadata()
+        self._join_edges_with_metadata()
+        self._deduplicate_metadata()
+        # Cleanup intermediate table
+        self.con.execute("DROP TABLE merged_raw")
 
 
     def assemble_edges(self, output_path: str = None):
         """
-        Runs the edge assembler pipeline:
+        Runs the full edge assembler pipeline:
             1. aggregate the edges
             2. add artist and album info
-
-        Add an output path to save the filtered file.
 
         Args:
             output_path: path to output file, default: None
