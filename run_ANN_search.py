@@ -30,7 +30,7 @@ def check_prev_files():
 
 
 def recommend_popular():
-    print("\nmaking popularity-based recommendations ")
+    print("making popularity-based recommendations ")
     song_ids = np.load(config.paths.popular_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)
     top_k_ids = song_ids[config.ann.top_k:]
@@ -41,7 +41,7 @@ def recommend_popular():
 
 
 def recommend_random():
-    print("\nmaking random recommendations ")
+    print("making random recommendations ")
     song_ids = np.load(config.paths.filtered_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)
     num_users = len(user_ids)
@@ -54,7 +54,7 @@ def recommend_random():
 
 
 def recommend_cf(top_k=10, top_sim_items=50):
-    print("\nmaking content-based recommendations ")
+    print("making collaborative filtering recommendations ")
     """
     Memory-friendly item-based CF using sparse operations.
     Returns a dict: {user_id: [song_id1, song_id2, ...], ...}
