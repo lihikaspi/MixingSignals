@@ -105,8 +105,8 @@ def main():
 
     best_params = study.best_params
 
-    with open(config.paths.best_param, "w") as f:
-        json.dump(best_params, f, indent=4)
+    # with open(config.paths.best_param, "w") as f:
+    #     json.dump(best_params, f, indent=4)
 
     print("Best hyperparameters:", best_params)
 

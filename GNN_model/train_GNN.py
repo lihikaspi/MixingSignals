@@ -231,7 +231,7 @@ class GNNTrainer:
         """Cosine annealing with warmup."""
         if self.step_count < self.warmup_steps:
             return self.lr_base * (
-                        self.step_count / self.warmup_steps) if self.step_count > 0 else self.lr_base / self.warmup_steps
+                    self.step_count / self.warmup_steps) if self.step_count > 0 else self.lr_base / self.warmup_steps
 
         cycle_epoch = (epoch - (self.warmup_steps / len(self.loader))) % 3
         return 1e-6 + (self.lr_base - 1e-6) * (1 + math.cos(math.pi * cycle_epoch / 3)) / 2
@@ -307,19 +307,30 @@ class GNNTrainer:
 
                 (loss / self.accum_steps).backward(retain_graph=True)
 
+                # Calculate current LR for this step (using epoch info or warmup)
+                current_lr = self._get_lr(epoch)
+
                 if (i + 1) % self.accum_steps == 0:
                     self.step_count += 1
-                    self._update_parameters(self._get_lr(epoch))
+                    # Re-calculate LR if step count changed (mostly relevant during warmup)
+                    current_lr = self._get_lr(epoch)
+                    self._update_parameters(current_lr)
                     self.model.zero_grad(set_to_none=True)
 
                 total_loss += loss.item()
-                progress.set_postfix({'loss': f'{total_loss / (i + 1):.4f}'})
+
+                # Added 'lr' to the progress bar
+                progress.set_postfix({'loss': f'{total_loss / (i + 1):.4f}', 'lr': f'{current_lr:.6f}'})
 
             # 3. Evaluation
             self.model.eval()
             val_metrics = GNNEvaluator(self.model, self.train_graph, "val", self.config).evaluate()
             ndcg = val_metrics['ndcg@k']
             print(f"Epoch {epoch} | NDCG: {ndcg:.4f}")
+
+            # --- FIX: Ensure model is moved back to CPU for the next training epoch ---
+            self.model.to(self.device)
+            # ------------------------------------------------------------------------
 
             if ndcg > self.best_ndcg:
                 self.best_ndcg = ndcg
@@ -330,6 +341,7 @@ class GNNTrainer:
                     print(f"> Best model saved ({ndcg:.4f})")
             else:
                 patience += 1
+                print(f"> no improvement ({patience}/{self.max_patience})")
                 if patience >= self.max_patience:
                     print(f"Early stopping at epoch {epoch}")
                     break

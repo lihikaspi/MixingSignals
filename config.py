@@ -217,7 +217,7 @@ class GNNConfig:
     })
 
     embed_dim: int = 128
-    num_layers: int = 3
+    num_layers: int = 5
     lambda_align: float = 0.0
     audio_lr_scale: float = 0.1
 
@@ -225,9 +225,9 @@ class GNNConfig:
     edge_mlp_input_dim: int = 4
 
     listen_weight: float = 0.8
-    neutral_neg_weight: float = 0.5
+    neutral_neg_weight: float = 0.31
 
-    lr: float = 0.01
+    lr: float = 0.07
     lr_decay: float = 0.98
     momentum: float = 0.9
     max_grad_norm: float = 1.0
@@ -235,16 +235,16 @@ class GNNConfig:
 
     num_epochs: int = 50
     batch_size: int = 256
-    weight_decay: float = 1e-5
+    weight_decay: float = 4e-6
     num_workers: int = 8
     eval_every: int = 5
-    neg_samples_per_pos: int = 2
+    neg_samples_per_pos: int = 3
     accum_steps: int = 1
     audio_scale: float = 0.5
     metadata_scale: float = 30.0
-    dropout: float = 0.25
+    dropout: float = 0.005
     margin: float = 0.3
-    max_patience: int = 10
+    max_patience: int = 5
 
     eval_batch_size: int = 512
 
