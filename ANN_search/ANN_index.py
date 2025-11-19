@@ -133,7 +133,7 @@ class ANNIndex:
 
         results = {uid: recs.tolist() for uid, recs in zip(self.user_ids, rec_song_ids)}
 
-        print(f"Generated top-{k} recommendations for {len(self.user_embs)} users.")
+        print(f"Generated top-{k} recommendations for {len(self.user_embs)} users.\n")
         return results, rec_scores
 
 
@@ -143,5 +143,4 @@ class ANNIndex:
         self.build_index()
         self.save()
         results, _ = self.recommend(self.top_k)
-        print()
         return results

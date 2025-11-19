@@ -52,10 +52,6 @@ def test_evaluation(model: LightGCN, train_graph: HeteroData):
 def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path: str):
     """
     Saves final user and song embeddings to disk.
-
-    This function sets the model to evaluation mode and calls the
-    memory-efficient `forward_cpu` method to get embeddings
-    without causing GPU OOM errors.
     """
     print("Starting to save final embeddings...")
     torch.cuda.empty_cache()
@@ -63,17 +59,18 @@ def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path
 
     with torch.no_grad():
         # Call the new CPU-based forward method.
-        # This returns user and item embeddings as CPU tensors.
         user_emb, item_emb, _ = model.forward_cpu()
 
         print("Converting final embeddings to NumPy...")
-        # Convert to NumPy
-        # Tensors are already on CPU, so .numpy() is direct and fast
         user_emb_np = user_emb.numpy().astype(np.float32)
         item_emb_np = item_emb.numpy().astype(np.float32)
 
-        # Get original IDs (assuming these are already on CPU or small)
-        user_ids_np = model.user_original_ids.cpu().numpy()
+        # --- KEY FIX: Save User Indices (0..N) to match test_scores.parquet ---
+        # model.user_original_ids are the UIDs (e.g. 1005).
+        # But test_scores uses indices (0, 1, 2...).
+        user_ids_np = np.arange(model.num_users, dtype=np.int64)
+
+        # Items still use Original IDs because test_scores uses Original Item IDs
         item_ids_np = model.item_original_ids.cpu().numpy()
 
         # Save to .npz files

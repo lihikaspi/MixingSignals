@@ -90,6 +90,8 @@ class PathsConfig:
     gnn_song_ids: str = field(init=False)
     content_index: str = field(init=False)
     content_song_ids: str = field(init=False)
+    cf_index: str = field(init=False)
+    cf_song_ids: str = field(init=False)
 
     test_eval: str = field(init=False)
     val_eval: str = field(init=False)
@@ -163,6 +165,8 @@ class PathsConfig:
         self.gnn_song_ids = f"{self.ann_models_dir}/gnn_song_ids.npy"
         self.content_index = f"{self.ann_models_dir}/content_index.faiss"
         self.content_song_ids = f"{self.ann_models_dir}/content_song_ids.npy"
+        self.cf_index = f"{self.ann_models_dir}/cf_index.faiss"
+        self.cf_song_ids = f"{self.ann_models_dir}/cf_song_ids.npy"
 
         self.test_eval = f"{self.eval_dir}/gnn_test_eval.txt"
         self.val_eval = f"{self.eval_dir}/gnn_val_eval.txt"
