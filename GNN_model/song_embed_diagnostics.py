@@ -60,9 +60,3 @@ def diagnose_embedding_scales(model, sample_items=100):
 
         return rec_audio_scale, rec_metadata_scale
 
-# Usage in your training script:
-# Before training, run:
-# audio_scale, metadata_scale = diagnose_embedding_scales(model)
-# Then update your model:
-# model.audio_scale = audio_scale
-# model.metadata_scale = metadata_scale

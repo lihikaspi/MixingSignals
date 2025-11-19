@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from config import config
 from scipy.sparse import csr_matrix
-from sklearn.preprocessing import normalize
+from sklearn.decomposition import TruncatedSVD
 from ANN_search.ANN_index import ANNIndex
 from ANN_search.ANN_eval import RecEvaluator
 
@@ -15,7 +15,7 @@ def check_prev_files():
     """
     needed = [config.paths.user_embeddings_gnn, config.paths.song_embeddings_gnn,
               config.paths.cold_start_songs_file, config.paths.filtered_audio_embed_file,
-              config.paths.filtered_user_embed_file, config.paths.filtered_song_ids,   # FIX: plural
+              config.paths.filtered_user_embed_file, config.paths.filtered_song_ids,
               config.paths.filtered_user_ids, config.paths.popular_song_ids,
               config.paths.positive_interactions_file]
     fail = False
@@ -30,90 +30,76 @@ def check_prev_files():
 
 
 def recommend_popular():
+    print("making popularity-based recommendations")
     song_ids = np.load(config.paths.popular_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)
-    
-    top_k_ids = song_ids[:config.ann.top_k]
-    results = {int(uid): top_k_ids.tolist() for uid in user_ids}
+    top_k_recs = song_ids[:config.ann.top_k].tolist()
+
+    results = {uid: top_k_recs for uid in user_ids}
+
     return results
 
 
 def recommend_random():
-  
+    print("making random recommendations ")
     song_ids = np.load(config.paths.filtered_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)
     num_users = len(user_ids)
     num_songs = len(song_ids)
-    idx = np.random.randint(num_songs, size=(num_users, config.ann.top_k))
-    rec_song_ids = song_ids[idx]  # map to real item IDs
-    results = {int(uid): recs.tolist() for uid, recs in zip(user_ids, rec_song_ids)}
+    rec_song_ids = np.random.randint(num_songs, size=(num_users, config.ann.top_k))
+
+    results = {uid: recs.tolist() for uid, recs in zip(user_ids, rec_song_ids)}
+
     return results
 
 
-def recommend_cf(top_k=10, top_sim_items=50):
+def prepare_cf_index(n_components=64) -> ANNIndex:
     """
-    Memory-friendly item-based CF using sparse operations.
-    Returns a dict: {user_id: [song_id1, song_id2, ...], ...}
+    Calculates variables for Collaborative Filtering using Matrix Factorization (SVD).
+    Injects them into an ANNIndex instance and returns it.
     """
-    # ---- Step 1: Load interactions ----
-    interactions = pd.read_parquet(config.paths.positive_interactions_file)
-    # columns: ['user_id', 'item_id']
+    print("Preparing SVD-based CF variables...")
 
-    # ---- Step 2: Load user and song IDs ----
+    # 1. Load Data
+    interactions = pd.read_parquet(config.paths.positive_interactions_file)
     user_ids = np.load(config.paths.filtered_user_ids)
-    song_ids = np.load(config.paths.filtered_song_ids)  # FIX: plural key
+    song_ids = np.load(config.paths.filtered_song_ids)
 
     user_to_idx = {u: i for i, u in enumerate(user_ids)}
-    idx_to_user = {i: u for i, u in enumerate(user_ids)}
     song_to_idx = {s: i for i, s in enumerate(song_ids)}
-    idx_to_song = {i: s for i, s in enumerate(song_ids)}
 
-    num_users = len(user_ids)
-    num_songs = len(song_ids)
+    # 2. Build Sparse Matrix
+    # Filter only valid users/items
+    valid_mask = interactions['user_id'].isin(user_to_idx) & interactions['item_id'].isin(song_to_idx)
+    valid_interactions = interactions[valid_mask]
 
-    # ---- Step 3: Build sparse user-item matrix ----
-    rows, cols, data = [], [], []
-    for row in interactions.itertuples(index=False):
-        u, s = row.user_id, row.item_id
-        if u in user_to_idx and s in song_to_idx:
-            rows.append(user_to_idx[u])
-            cols.append(song_to_idx[s])
-            data.append(1.0)  # implicit feedback
+    rows = valid_interactions['user_id'].map(user_to_idx).values
+    cols = valid_interactions['item_id'].map(song_to_idx).values
+    data = np.ones(len(rows), dtype=np.float32)
 
-    R = csr_matrix((data, (rows, cols)), shape=(num_users, num_songs), dtype=np.float32)
+    R = csr_matrix((data, (rows, cols)), shape=(len(user_ids), len(song_ids)), dtype=np.float32)
 
-    # ---- Step 4: Normalize item vectors ----
-    # L2 normalize columns (item vectors)
-    R_item = R.T.tocsr()
-    R_item_norm = normalize(R_item, axis=1)
+    # 3. SVD (Matrix Factorization)
+    print(f"Computing TruncatedSVD with {n_components} components...")
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
 
-    # ---- Step 5: Compute top neighbors for each item sparsely ----
-    top_neighbors = {}
-    for i in range(num_songs):
-        vec_i = R_item_norm[i]
-        # Only compute dot product with items that share users
-        coo = vec_i.dot(R_item_norm.T)
-        # convert to dict of top items
-        if coo.nnz > 0:
-            sims = coo.toarray().ravel()
-            sims[i] = 0.0  # ignore self
-            top_idx = np.argsort(-sims)[:top_sim_items]
-            top_neighbors[i] = {j: sims[j] for j in top_idx if sims[j] > 0}
+    # User embeddings: Projection of users onto latent features
+    user_emb_svd = svd.fit_transform(R)
 
-    # ---- Step 6: Generate recommendations ----
-    results_dict = {}
-    for u_idx in range(num_users):
-        user_vector = R[u_idx].indices  # items user interacted with
-        scores = {}
-        for item in user_vector:
-            neighbors = top_neighbors.get(item, {})
-            for n_item, sim in neighbors.items():
-                if n_item not in user_vector:
-                    scores[n_item] = scores.get(n_item, 0) + sim
-        top_items = sorted(scores, key=lambda x: -scores[x])[:top_k]
-        results_dict[int(idx_to_user[u_idx])] = [int(idx_to_song[i]) for i in top_items]
+    # Item embeddings: The latent features themselves (transpose V)
+    item_emb_svd = svd.components_.T
 
-    return results_dict
+    # 4. Init ANNIndex and Inject Data
+    print("Initializing ANNIndex for CF...")
+    cf_ann = ANNIndex("cf", config)
+
+    # Manually set the variables usually loaded from disk
+    cf_ann.user_embs = user_emb_svd.astype(np.float32)
+    cf_ann.song_embs = item_emb_svd.astype(np.float32)
+    cf_ann.user_ids = user_ids
+    cf_ann.song_ids = song_ids
+
+    return cf_ann
 
 
 def main():
@@ -123,9 +109,13 @@ def main():
     content_index = ANNIndex("content", config)
     content_recs = content_index.retrieve_recs()
 
+    cf_index_obj = prepare_cf_index()
+    cf_index_obj.build_index()
+    cf_index_obj.save()
+    cf_recs, _ = cf_index_obj.recommend()
+
     popular_recs = recommend_popular()
     random_recs = recommend_random()
-    cf_recs = recommend_cf()
 
     recs = {
         "gnn": gnn_recs,
@@ -135,6 +125,7 @@ def main():
         "cf": cf_recs
     }
 
+    print("\n----------- EVALUATION  -----------")
     evaluator = RecEvaluator(recs, config)
     evaluator.eval()
 

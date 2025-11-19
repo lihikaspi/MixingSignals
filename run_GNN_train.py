@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import os
 import numpy as np
 import gc
@@ -9,7 +8,7 @@ from GNN_model.train_GNN import GNNTrainer
 from GNN_model.GNN_class import LightGCN
 from GNN_model.eval_GNN import GNNEvaluator
 from config import config
-from GNN_model.diagnostics import diagnose_embedding_scales
+from GNN_model.song_embed_diagnostics import diagnose_embedding_scales
 
 
 def check_prev_files():
@@ -18,7 +17,8 @@ def check_prev_files():
     if at least one file is missing raises FileNotFoundError
     """
     needed = [config.paths.audio_embeddings_file, config.paths.train_graph_file,
-              config.paths.test_scores_file]
+              config.paths.test_scores_file, config.paths.negative_train_in_graph_file,
+              config.paths.negative_train_cold_start_file]
     fail = False
     for file in needed:
         if not os.path.exists(file):
@@ -38,6 +38,7 @@ def test_evaluation(model: LightGCN, train_graph: HeteroData):
 
     print(f"Test set metrics @K={k_hit}:")
     print(f"  NDCG@{k_hit}: {test_metrics['ndcg@k']:.4f}")
+    print(f"  NDCG_raw@{k_hit}: {test_metrics['ndcg_raw@k']:.4f}")
     print(f"  Hit@{k_hit} (like only): {test_metrics['hit_like@k']:.4f}")
     print(f"  Hit@{k_hit} (like+listen): {test_metrics['hit_like_listen@k']:.4f}")
     print(f"  AUC: {test_metrics['auc']:.4f}")
@@ -51,10 +52,6 @@ def test_evaluation(model: LightGCN, train_graph: HeteroData):
 def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path: str):
     """
     Saves final user and song embeddings to disk.
-
-    This function sets the model to evaluation mode and calls the
-    memory-efficient `forward_cpu` method to get embeddings
-    without causing GPU OOM errors.
     """
     print("Starting to save final embeddings...")
     torch.cuda.empty_cache()
@@ -62,17 +59,18 @@ def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path
 
     with torch.no_grad():
         # Call the new CPU-based forward method.
-        # This returns user and item embeddings as CPU tensors.
         user_emb, item_emb, _ = model.forward_cpu()
 
         print("Converting final embeddings to NumPy...")
-        # Convert to NumPy
-        # Tensors are already on CPU, so .numpy() is direct and fast
         user_emb_np = user_emb.numpy().astype(np.float32)
         item_emb_np = item_emb.numpy().astype(np.float32)
 
-        # Get original IDs (assuming these are already on CPU or small)
-        user_ids_np = model.user_original_ids.cpu().numpy()
+        # --- KEY FIX: Save User Indices (0..N) to match test_scores.parquet ---
+        # model.user_original_ids are the UIDs (e.g. 1005).
+        # But test_scores uses indices (0, 1, 2...).
+        user_ids_np = np.arange(model.num_users, dtype=np.int64)
+
+        # Items still use Original IDs because test_scores uses Original Item IDs
         item_ids_np = model.item_original_ids.cpu().numpy()
 
         # Save to .npz files

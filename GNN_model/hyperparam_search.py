@@ -8,42 +8,53 @@ from GNN_model.eval_GNN import GNNEvaluator
 from config import config
 
 
-def test_evaluation(model: LightGCN, train_graph: HeteroData):
-    test_evaluator = GNNEvaluator(model, train_graph, "test", config)
-    test_metrics = test_evaluator.evaluate()
-
-    print(f"trial NDCG@K: {test_metrics['ndcg@k']}")
-
-    return test_metrics['ndcg@k']
-
-
 def objective(trial):
-    # --- CORRECTED RANGES ---
+    # --- UPDATED SEARCH RANGES BASED ON config.py ---
     try:
-        # lr: Range shrunk. 0.1 is very high for this type of model.
-        # Centered around your default of 0.01.
-        lr = trial.suggest_float("lr", 1e-4, 5e-2, log=True)
+        # Best lr: 0.01. Range (1e-4, 5e-2) is good.
+        lr = trial.suggest_float("lr", 0.05, 0.2, log=True)
 
-        # neg_samples_per_pos: Range is good, centered on default of 5.
-        neg_samples_per_pos = trial.suggest_int("neg_samples_per_pos", 2, 8)
+        # Best neg_samples_per_pos: 2. Let's search [2, 3, 4, 5, 6]
+        neg_samples_per_pos = trial.suggest_int("neg_samples_per_pos", 2, 6)
 
-        # listen_weight: Range extended to 1.0 to test "no extra weight".
-        listen_weight = trial.suggest_float("listen_weight", 0.5, 1.0)
+        # Best listen_weight: 0.8. Let's search around it.
+        # listen_weight = trial.suggest_float("listen_weight", 0.6, 1.0)
 
-        # neutral_neg_weight: Range is good, centered on default of 0.3.
-        neutral_neg_weight = trial.suggest_float("neutral_neg_weight", 0.1, 0.5)
+        # Best neutral_neg_weight: 0.5. Let's search around it.
+        neutral_neg_weight = trial.suggest_float("neutral_neg_weight", 0.3, 0.7)
 
-        # num_layers: Range shrunk significantly. LightGCN over-smooths.
-        # Centered around your default of 3.
+        # Best num_layers: 3. Range [2, 5] is good.
         num_layers = trial.suggest_int("num_layers", 2, 5)
 
-        # --- END CORRECTIONS ---
+        # Best weight_decay: 1e-5. Range (1e-6, 1e-3) is good.
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
 
+        # Best dropout: 0.25. Range (0.0, 0.5) is good.
+        dropout = trial.suggest_float("dropout", 0.0, 0.5)
+
+        # Best metadata_scale: 30.0. Let's search around it.
+        # metadata_scale = trial.suggest_float("metadata_scale", 10.0, 50.0, log=True)
+
+        # Best audio_scale: 0.5. Range (0.1, 2.0) is good.
+        # audio_scale = trial.suggest_float("audio_scale", 0.1, 2.0)
+
+        # Best margin: 0.3. Range (0.1, 0.5) is good.
+        margin = trial.suggest_float("bpr_margin", 0.1, 0.5)
+
+        # --- APPLY ALL SUGGESTED PARAMS ---
         config.gnn.lr = lr
         config.gnn.neg_samples_per_pos = neg_samples_per_pos
-        config.gnn.listen_weight = listen_weight
+        # config.gnn.listen_weight = listen_weight
         config.gnn.neutral_neg_weight = neutral_neg_weight
         config.gnn.num_layers = num_layers
+        config.gnn.weight_decay = weight_decay
+        config.gnn.dropout = dropout
+        # config.gnn.metadata_scale = metadata_scale
+        # config.gnn.audio_scale = audio_scale
+        config.gnn.margin = margin  # Updated from bpr_margin
+
+        config.gnn.num_epochs = 7
+        config.gnn.max_patience = 2
 
         torch.cuda.empty_cache()
 
@@ -53,10 +64,17 @@ def objective(trial):
         trainer = GNNTrainer(model, train_graph, config)
 
         # Optional: short training for hyperparameter search
-        trainer.num_epochs = 8
+        # This will use trainer.best_ndcg from the training loop
         trainer.train(trial=True)
 
-        metric = test_evaluation(model, train_graph)  # returns the rank-based metric you care about
+        metric = trainer.best_ndcg
+
+        # Check if the metrics dict exists and save it
+        if hasattr(trainer, 'best_metrics'):
+            # Ensure metrics are JSON-serializable (convert tensors/numpy to float)
+            serializable_metrics = {k: (v.item() if hasattr(v, 'item') else v)
+                                    for k, v in trainer.best_metrics.items()}
+            trial.set_user_attr("best_metrics", serializable_metrics)
 
         return metric
 
@@ -71,13 +89,24 @@ def objective(trial):
 
 
 def main():
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=20)
+    storage_url = f"sqlite:///{config.paths.eval_dir}/hp_search.db"
+    # --- UPDATED STUDY NAME ---
+    study_name = "gnn_hp_search_cpu_no_scales"
+
+    study = optuna.create_study(
+        storage=storage_url,
+        study_name=study_name,
+        direction="maximize",
+        load_if_exists=True
+    )
+
+    # --- UPDATED TRIAL COUNT ---
+    study.optimize(objective, n_trials=100)  # Increased trials for more params
 
     best_params = study.best_params
 
-    with open(config.paths.best_param, "w") as f:
-        json.dump(best_params, f, indent=4)
+    # with open(config.paths.best_param, "w") as f:
+    #     json.dump(best_params, f, indent=4)
 
     print("Best hyperparameters:", best_params)
 

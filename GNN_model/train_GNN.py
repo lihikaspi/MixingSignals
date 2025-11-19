@@ -6,306 +6,350 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import json
 import math
-from torch_geometric.utils import subgraph
 from GNN_model.GNN_class import LightGCN
 from GNN_model.eval_GNN import GNNEvaluator
 from config import Config
 from collections import defaultdict
+import pandas as pd
 
 
 class BPRDataset(Dataset):
     """
-    Advanced BPR Dataset that samples "hard" negatives (dislikes)
-    and "easy" negatives (random unseen).
+    Advanced BPR Dataset.
+    Uses pre-computed hybrid ratio from the graph as positive weight.
     """
-    def __init__(self, train_graph, config: Config):
-        print(">>> Initializing Advanced BPRDataset...")
-        edge_index = train_graph['user', 'interacts', 'item'].edge_index
-        edge_attr = train_graph['user', 'interacts', 'item'].edge_attr
 
-        user_idx, item_idx = edge_index.cpu()
-        edge_types = edge_attr[:, 0].cpu()
-
-        self.user2pos = {}
-        self.user2pos_types = {}
-        self.user2neg = {}
+    def __init__(self, train_graph, config: Config, raw_user2neg: dict):
+        self.config = config
         self.num_items = int(train_graph['item'].num_nodes)
-        self.all_users_pos_sets = defaultdict(set)
+        self.raw_user2neg = raw_user2neg
 
-        self.listen_weight = config.gnn.listen_weight
+        # Hyperparameters
         self.neutral_neg_weight = config.gnn.neutral_neg_weight
         self.neg_samples_per_pos = config.gnn.neg_samples_per_pos
         self.edge_type_mapping = config.preprocessing.edge_type_mapping
 
-        pos_types = [self.edge_type_mapping[k] for k in ["listen", "like", "undislike"]]
-        neg_types = [self.edge_type_mapping[k] for k in ["dislike", "unlike"]]
+        # Process graph data
+        self.user2pos, self.user2pos_ratios, self.all_users_pos_sets = self._process_graph_edges(train_graph)
 
-        print("    Building user-to-item positive/negative maps...")
-        for u, i, t in zip(user_idx.tolist(), item_idx.tolist(), edge_types.tolist()):
-            t_int = int(round(t))
-            if t_int in pos_types:
-                self.user2pos.setdefault(u, []).append(i)
-                self.user2pos_types.setdefault(u, []).append(t_int)
-                self.all_users_pos_sets[u].add(i)
-            elif t_int in neg_types:
-                self.user2neg.setdefault(u, []).append(i)
-
-        print("    Cleaning hard negative lists...")
-        for u in self.user2neg:
-            self.user2neg[u] = list(set(self.user2neg[u]) - self.all_users_pos_sets[u])
+        # Process negatives
+        self.user2neg = self._clean_negative_samples()
 
         self.users = sorted(list(self.user2pos.keys()))
-        print(f"Advanced BPRDataset: Loaded {len(self.users)} users with positive interactions.")
+        print(f"Advanced BPRDataset: Loaded {len(self.users)} users.")
+
+
+    def _process_graph_edges(self, graph):
+        """Parses graph edges to build positive interaction maps."""
+        edge_index = graph['user', 'interacts', 'item'].edge_index.cpu()
+        edge_attr = graph['user', 'interacts', 'item'].edge_attr.cpu()
+
+        # Indices for attributes (0=type, 2=ratio based on build_graph.py)
+        # If config has it, use config, else default to implicit knowledge of build_graph
+        idx_type = getattr(self.config.gnn, 'edge_attr_indices', {}).get('type', 0)
+        idx_ratio = getattr(self.config.gnn, 'edge_attr_indices', {}).get('ratio', 2)
+
+        types = edge_attr[:, idx_type]
+        ratios = edge_attr[:, idx_ratio]
+
+        user2pos = defaultdict(list)
+        user2pos_ratios = defaultdict(list)
+        pos_sets = defaultdict(set)
+
+        pos_types = [self.edge_type_mapping[k] for k in ["listen", "like", "undislike"]]
+
+        for u, i, t, r in zip(edge_index[0].tolist(), edge_index[1].tolist(), types.tolist(), ratios.tolist()):
+            if int(round(t)) in pos_types:
+                user2pos[u].append(i)
+                user2pos_ratios[u].append(r)
+                pos_sets[u].add(i)
+
+        return user2pos, user2pos_ratios, pos_sets
+
+
+    def _clean_negative_samples(self):
+        """Filters raw negatives to ensure they don't overlap with positives."""
+        clean_map = {}
+        for u, neg_tuples in self.raw_user2neg.items():
+            pos_set = self.all_users_pos_sets.get(u, set())
+            valid_negs = []
+            for (idx, embed) in neg_tuples:
+                # idx -1 is cold start (always valid), otherwise check disjoint
+                if idx == -1 or idx not in pos_set:
+                    valid_negs.append((idx, embed))
+
+            if valid_negs:
+                clean_map[u] = valid_negs
+        return clean_map
+
 
     def __len__(self):
         return len(self.users)
 
+
     def __getitem__(self, idx):
         u = self.users[idx]
-        pos_items = self.user2pos[u]
-        pos_types = self.user2pos_types[u]
-        hard_negs_list = self.user2neg.get(u, []).copy()
-        known_pos_set = self.all_users_pos_sets[u]
 
-        i_pos_idx = np.random.randint(len(pos_items))
-        i_pos = pos_items[i_pos_idx]
-        edge_type_of_pos = pos_types[i_pos_idx]
-        pos_weight = self.listen_weight if edge_type_of_pos == self.edge_type_mapping["listen"] else 1.0
+        # 1. Sample Positive
+        pos_idx = np.random.randint(len(self.user2pos[u]))
+        i_pos = self.user2pos[u][pos_idx]
+        pos_weight = self.user2pos_ratios[u][pos_idx]
 
-        neg_samples = []
-        neg_weights = []
+        # 2. Sample Negatives
+        hard_negs = self.user2neg.get(u, []).copy()
+        pos_set = self.all_users_pos_sets[u]
+
+        neg_indices, neg_embeds, neg_weights = [], [], []
+
         for _ in range(self.neg_samples_per_pos):
-            if len(hard_negs_list) > 0:
-                i_neg_idx = np.random.randint(len(hard_negs_list))
-                i_neg = hard_negs_list.pop(i_neg_idx)
-                weight = 1.0
+            if hard_negs:
+                # Hard Negative (Explicit Dislike)
+                sample = hard_negs.pop(np.random.randint(len(hard_negs)))
+                neg_indices.append(sample[0])
+                neg_embeds.append(sample[1])
+                neg_weights.append(1.0)
             else:
+                # Easy Negative (Random Sampling)
                 while True:
-                    i_neg = np.random.randint(self.num_items)
-                    if i_neg not in known_pos_set:
+                    rnd = np.random.randint(self.num_items)
+                    if rnd not in pos_set:
+                        neg_indices.append(rnd)
+                        neg_embeds.append(None)
+                        neg_weights.append(self.neutral_neg_weight)
                         break
-                weight = self.neutral_neg_weight
-            neg_samples.append(i_neg)
-            neg_weights.append(weight)
 
         return (
             torch.tensor(u, dtype=torch.long),
             torch.tensor(i_pos, dtype=torch.long),
-            torch.tensor(neg_samples, dtype=torch.long),  # [k]
-            torch.tensor(pos_weight, dtype=torch.float),  # scalar
-            torch.tensor(neg_weights, dtype=torch.float)  # [k]
+            neg_indices, neg_embeds,
+            torch.tensor(pos_weight, dtype=torch.float),
+            torch.tensor(neg_weights, dtype=torch.float)
         )
 
 
 def collate_bpr_advanced(batch):
+    """Collates BPR batch, handling variable audio embeddings."""
+    batch_size = len(batch)
+    k = len(batch[0][2])
+
+    # Detect embedding dim
+    embed_dim = 128
+    for b in batch:
+        for emb in b[3]:
+            if emb is not None:
+                embed_dim = len(emb)
+                break
+
     u_idx = torch.stack([b[0] for b in batch])
-    i_pos_idx = torch.stack([b[1] for b in batch])
-    i_neg_idx = torch.stack([b[2] for b in batch])  # [batch_size, k]
-    pos_weights = torch.stack([b[3] for b in batch])
-    neg_weights = torch.stack([b[4] for b in batch])  # [batch_size, k]
-    return u_idx, i_pos_idx, i_neg_idx, pos_weights, neg_weights
+    i_pos = torch.stack([b[1] for b in batch])
+    pos_w = torch.stack([b[4] for b in batch])
+    neg_w = torch.stack([b[5] for b in batch])
+
+    i_neg = torch.zeros((batch_size, k), dtype=torch.long)
+    neg_emb = torch.zeros((batch_size, k, embed_dim), dtype=torch.float)
+    is_cold = torch.zeros((batch_size, k), dtype=torch.bool)
+
+    for i, (_, _, indices, embeds, _, _) in enumerate(batch):
+        i_neg[i] = torch.tensor(indices, dtype=torch.long)
+        for j, emb in enumerate(embeds):
+            if emb is not None:
+                neg_emb[i, j] = torch.tensor(emb, dtype=torch.float)
+                is_cold[i, j] = True
+
+    return u_idx, i_pos, i_neg, neg_emb, is_cold, pos_w, neg_w
 
 
 class GNNTrainer:
-    """Trainer for BPR loss (patched: lower dropout, constant LR for sanity)."""
     def __init__(self, model: LightGCN, train_graph, config: Config):
         self.config = config
-        self.device = config.gnn.device
+        self.device = torch.device('cpu')  # Force CPU for training loop
         self.model = model.to(self.device)
-        self.train_graph = train_graph
-        self.batch_size = config.gnn.batch_size
-        self.num_epochs = config.gnn.num_epochs
-        self.save_path = config.paths.trained_gnn
-        self.neg_samples_per_pos = config.gnn.neg_samples_per_pos
+        self.train_graph = train_graph.to(self.device)
 
-        self.dataset = BPRDataset(train_graph, config)
-        self.num_users = self.model.num_users
-        self.num_items = self.dataset.num_items
-        self.total_nodes = self.num_users + self.num_items
+        self._init_hyperparameters(config)
 
-        pin_memory = 'cuda' in str(self.device)
+        # Prepare Data
+        neg_map = self._load_negative_interactions()
+        self.dataset = BPRDataset(train_graph, config, neg_map)
+
         self.loader = DataLoader(
             self.dataset,
-            batch_size=self.batch_size,
+            batch_size=config.gnn.batch_size,
             shuffle=True,
             num_workers=config.gnn.num_workers,
             collate_fn=collate_bpr_advanced,
-            pin_memory=pin_memory,
-            persistent_workers=True if config.gnn.num_workers > 0 else False
+            pin_memory=False,
+            drop_last=False
         )
-
-        self.edge_index_full = self.model.edge_index.cpu()
-        self.edge_weight_full = self.model.edge_weight_init.cpu()
-
-        self.lr_base = config.gnn.lr
-        self.lr_decay = config.gnn.lr_decay
-        self.weight_decay = config.gnn.weight_decay
-        self.max_grad_norm = config.gnn.max_grad_norm
 
         self.step_count = 0
         self.warmup_steps = len(self.loader)
+
+        # Metrics tracking
+        self.best_ndcg = 0.0
+        self.best_metrics = None  # <--- Added to track best dictionary
+
+
+    def _init_hyperparameters(self, config):
+        """Sets up training hyperparameters."""
+        self.num_epochs = config.gnn.num_epochs
+        self.save_path = config.paths.trained_gnn
+        self.lr_base = config.gnn.lr
         self.accum_steps = config.gnn.accum_steps
+        self.max_grad_norm = config.gnn.max_grad_norm
+        self.weight_decay = config.gnn.weight_decay
+        self.margin = config.gnn.margin
+        self.dropout = config.gnn.dropout
+        self.max_patience = config.gnn.max_patience
+
+
+    def _load_negative_interactions(self):
+        """Loads In-Graph and Cold-Start negatives into a unified map."""
+        # Map item_id -> graph_idx
+        item_ids = self.train_graph['item'].item_id.cpu().numpy()
+        id_map = {uid: i for i, uid in enumerate(item_ids)}
+
+        neg_map = defaultdict(list)
+
+        # 1. In-Graph
+        df_graph = pd.read_parquet(self.config.paths.negative_train_in_graph_file, columns=['user_id', 'item_id'])
+        for row in df_graph.itertuples(index=False):
+            idx = id_map.get(row.item_id, -1)
+            if idx != -1:
+                neg_map[row.user_id].append((idx, None))
+
+        # 2. Cold-Start
+        df_cold = pd.read_parquet(self.config.paths.negative_train_cold_start_file,
+                                  columns=['user_id', 'normalized_embed'])
+        for row in df_cold.itertuples(index=False):
+            neg_map[row.user_id].append((-1, row.normalized_embed))
+
+        return neg_map
+
 
     def _get_lr(self, epoch):
-        """
-        Patched for sanity: use a constant LR (no warmup/cosine) to verify learning.
-        Revert to your original scheduler once metrics climb.
-        """
-        return self.lr_base
+        """Cosine annealing with warmup."""
+        if self.step_count < self.warmup_steps:
+            return self.lr_base * (
+                    self.step_count / self.warmup_steps) if self.step_count > 0 else self.lr_base / self.warmup_steps
+
+        cycle_epoch = (epoch - (self.warmup_steps / len(self.loader))) % 3
+        return 1e-6 + (self.lr_base - 1e-6) * (1 + math.cos(math.pi * cycle_epoch / 3)) / 2
+
 
     def _update_parameters(self, lr):
+        """Manual SGD update."""
         with torch.no_grad():
             for name, param in self.model.named_parameters():
-                if param.grad is None:
-                    continue
-                if 'user_emb' in name:
-                    param_lr = lr * 1.0
-                elif 'artist_emb' in name or 'album_emb' in name:
-                    param_lr = lr * 2.0
-                else:
-                    param_lr = lr
+                if param.grad is None: continue
+
+                # Param-specific LR
+                scale = 2.0 if 'artist_emb' in name or 'album_emb' in name else 0.5 if 'edge_mlp' in name else 1.0
+
                 grad = param.grad.data
                 if self.weight_decay > 0 and 'emb' in name:
                     grad = grad.add(param.data, alpha=self.weight_decay)
-                param.data.add_(grad, alpha=-param_lr)
+
+                param.data.add_(grad, alpha=-lr * scale)
+
+
+    def _calc_bpr_loss(self, u_emb, pos_i_emb, neg_i_emb, pos_w, neg_w):
+        """Computes weighted BPR loss."""
+        pos_scores = (u_emb * pos_i_emb).sum(dim=-1, keepdim=True)
+        neg_scores = (u_emb.unsqueeze(1) * neg_i_emb).sum(dim=-1)
+
+        loss = -F.logsigmoid(pos_scores - neg_scores - self.margin)
+        return (loss * pos_w.unsqueeze(1) * neg_w).mean()
+
 
     def train(self, trial=False):
-        print(f">>> starting training with ADVANCED BPR ranking loss (patched dropout/LR)")
+        print(f">>> Starting CPU-based Training (Advanced BPR)")
         os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-        self.model.to(self.device)
 
-        best_ndcg = 0.0
-        best_metrics = None
         patience = 0
-        max_patience = 10
-
         for epoch in range(1, self.num_epochs + 1):
             self.model.train()
-            epoch_loss = 0.0
-            epoch_grad_norm = 0.0
-            num_batches = 0
-            current_lr = self._get_lr(epoch)
-            progress = tqdm(self.loader, desc=f"Epoch {epoch} (LR={current_lr:.6f})", leave=True)
 
-            for batch_idx, batch in enumerate(progress):
-                u_idx, i_pos_idx, i_neg_idx, pos_weights, neg_weights = batch
+            # 1. Full Graph Forward (CPU) - Compute embeddings once per epoch
+            print(f">>> Epoch {epoch}: Computing full graph embeddings...")
+            u_all, i_all, _ = self.model.forward_cpu()
 
-                # --- Build Subgraph ---
-                batch_nodes_set = set(u_idx.numpy())
-                batch_nodes_set.update(i_pos_idx.numpy() + self.num_users)
-                batch_nodes_set.update(i_neg_idx.numpy().flatten() + self.num_users)
-                batch_nodes = torch.tensor(list(batch_nodes_set), device='cpu')
+            # 2. Batch Training
+            total_loss = 0
+            progress = tqdm(self.loader, desc=f"Epoch {epoch}", leave=True)
 
-                edge_index_sub, edge_weight_sub = subgraph(
-                    batch_nodes,
-                    self.edge_index_full,
-                    edge_attr=self.edge_weight_full,
-                    relabel_nodes=True,
-                    num_nodes=self.total_nodes
-                )
+            for i, batch in enumerate(progress):
+                u_idx, pos_idx, neg_idx, neg_embs, is_cold, pos_w, neg_w = [x.to(self.device) for x in batch]
 
-                # PATCH: Lower edge dropout to 0.05
-                if self.model.training:
-                    dropout_rate = 0.05  # was 0.2
-                    keep_mask = (torch.rand(edge_index_sub.size(1), device=edge_index_sub.device) > dropout_rate)
-                    edge_index_sub = edge_index_sub[:, keep_mask]
-                    edge_weight_sub = edge_weight_sub[keep_mask]
+                # Lookup Embeddings
+                u_emb = F.dropout(u_all[u_idx], p=self.dropout, training=True)
+                pos_emb = F.dropout(i_all[pos_idx], p=self.dropout, training=True)
 
-                batch_nodes = batch_nodes.to(self.device)
-                edge_index_sub = edge_index_sub.to(self.device)
-                edge_weight_sub = edge_weight_sub.to(self.device)
+                # Assemble Negatives
+                neg_emb_batch = torch.zeros(u_idx.size(0), self.dataset.neg_samples_per_pos, self.model.embed_dim,
+                                            device=self.device)
 
-                x_sub, _, _ = self.model.forward_subgraph(
-                    batch_nodes,
-                    edge_index_sub,
-                    edge_weight_sub
-                )
+                # Fill Cold-Start
+                neg_emb_batch[is_cold] = neg_embs[is_cold]
 
-                node_map = torch.full((int(batch_nodes.max()) + 1,), -1, device=self.device)
-                node_map[batch_nodes] = torch.arange(len(batch_nodes), device=self.device)
+                # Fill In-Graph
+                mask_graph = ~is_cold
+                flat_idx = neg_idx[mask_graph]
+                if flat_idx.numel() > 0:
+                    neg_emb_batch[mask_graph] = i_all[flat_idx]
 
-                u_idx_gpu = u_idx.to(self.device)
-                i_pos_idx_gpu = i_pos_idx.to(self.device)
-                i_neg_idx_gpu = i_neg_idx.to(self.device)
-                pos_weights_gpu = pos_weights.to(self.device)
-                neg_weights_gpu = neg_weights.to(self.device)
+                neg_emb_batch = F.dropout(neg_emb_batch, p=self.dropout, training=True)
 
-                u_sub_idx = node_map[u_idx_gpu]
-                pos_i_sub_idx = node_map[i_pos_idx_gpu + self.num_users]
-                neg_i_sub_idx = node_map[i_neg_idx_gpu.flatten() + self.num_users].view_as(i_neg_idx_gpu)
+                # Loss & Backprop
+                loss = self._calc_bpr_loss(u_emb, pos_emb, neg_emb_batch, pos_w, neg_w)
 
-                u_emb = x_sub[u_sub_idx]
-                pos_i_emb = x_sub[pos_i_sub_idx]
-                neg_i_emb = x_sub[neg_i_sub_idx]
+                if not torch.isfinite(loss): raise ValueError("NaN loss")
 
-                # PATCH: Lower embedding dropout to 0.05
-                if self.model.training:
-                    u_emb = F.dropout(u_emb, p=0.05, training=True)      # was 0.2
-                    pos_i_emb = F.dropout(pos_i_emb, p=0.05, training=True)  # was 0.2
+                (loss / self.accum_steps).backward(retain_graph=True)
 
-                pos_scores = (u_emb * pos_i_emb).sum(dim=-1, keepdim=True)
-                neg_scores = (u_emb.unsqueeze(1) * neg_i_emb).sum(dim=-1)
-                diff = pos_scores - neg_scores
-                loss_per_neg = -F.logsigmoid(diff)
+                # Calculate current LR for this step (using epoch info or warmup)
+                current_lr = self._get_lr(epoch)
 
-                weighted_loss = loss_per_neg * pos_weights_gpu.unsqueeze(1) * neg_weights_gpu
-                loss = weighted_loss.mean()
-
-                if not torch.isfinite(loss):
-                    print(f"\n!!! NaN/Inf detected in BPR loss at epoch {epoch}, batch {batch_idx}!!!")
-                    raise ValueError("NaN/Inf in BPR loss. Stopping training.")
-
-                loss = loss / self.accum_steps
-                loss.backward()
-
-                if (batch_idx + 1) % self.accum_steps == 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.max_grad_norm
-                    )
-                    if not np.isfinite(grad_norm.item()):
-                        print(f"\n!!! NaN/Inf GRADIENT detected at epoch {epoch}, batch {batch_idx}!!!")
-                        self.model.zero_grad(set_to_none=True)
-                    else:
-                        self.step_count += 1
-                        current_step_lr = self._get_lr(epoch)
-                        self._update_parameters(current_step_lr)
-                        epoch_grad_norm += grad_norm.item()
+                if (i + 1) % self.accum_steps == 0:
+                    self.step_count += 1
+                    # Re-calculate LR if step count changed (mostly relevant during warmup)
+                    current_lr = self._get_lr(epoch)
+                    self._update_parameters(current_lr)
                     self.model.zero_grad(set_to_none=True)
 
-                epoch_loss += loss.item() * self.accum_steps
-                num_batches += 1
-                progress.set_postfix({'bpr_loss': f'{epoch_loss / num_batches:.6f}'})
+                total_loss += loss.item()
 
-            self.model.zero_grad(set_to_none=True)
-            progress.close()
-            avg_loss = epoch_loss / num_batches
-            avg_grad = epoch_grad_norm / (num_batches / self.accum_steps)
-            print(f"Epoch {epoch} | BPR Loss: {avg_loss:.6f} | Avg grad: {avg_grad:.4f}")
+                # Added 'lr' to the progress bar
+                progress.set_postfix({'loss': f'{total_loss / (i + 1):.4f}', 'lr': f'{current_lr:.6f}'})
 
-            if not trial:
-                self.model.eval()
-                val_evaluator = GNNEvaluator(self.model, self.train_graph, "val", self.config)
-                val_metrics = val_evaluator.evaluate()
-                cur_ndcg = val_metrics['ndcg@k']
-                print(f"Epoch {epoch} | NDCG@K: {cur_ndcg:.6f}")
+            # 3. Evaluation
+            self.model.eval()
+            val_metrics = GNNEvaluator(self.model, self.train_graph, "val", self.config).evaluate()
+            ndcg = val_metrics['ndcg@k']
+            print(f"Epoch {epoch} | NDCG: {ndcg:.4f}")
 
-                if cur_ndcg > best_ndcg:
-                    improvement = cur_ndcg - best_ndcg
-                    best_ndcg = cur_ndcg
-                    best_metrics = val_metrics
-                    patience = 0
+            # --- FIX: Ensure model is moved back to CPU for the next training epoch ---
+            self.model.to(self.device)
+            # ------------------------------------------------------------------------
+
+            if ndcg > self.best_ndcg:
+                self.best_ndcg = ndcg
+                self.best_metrics = val_metrics  # <--- Store best metrics
+                patience = 0
+                if not trial:
                     torch.save(self.model.state_dict(), self.save_path)
-                    print(f"> Best model saved ({improvement:.6f})")
-                else:
-                    patience += 1
-                    print(f"No improvement ({patience}/{max_patience})")
-                    if patience >= max_patience:
-                        print(f"Early stopping at epoch {epoch}")
-                        break
+                    print(f"> Best model saved ({ndcg:.4f})")
+            else:
+                patience += 1
+                print(f"> no improvement ({patience}/{self.max_patience})")
+                if patience >= self.max_patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
 
-        print(f"\n>>> finished training")
-        if not trial:
-            print(f"Best NDCG@K: {best_ndcg:.6f}")
+        # 4. Save Best Metrics to JSON (End of Training)
+        print(f"\n>>> Finished training. Best NDCG: {self.best_ndcg:.4f}")
+        if not trial and self.best_metrics is not None:
             with open(self.config.paths.val_eval, "w") as f:
-                json.dump(best_metrics, f, indent=4)
-            print(f"Model saved to {self.save_path}")
+                json.dump(self.best_metrics, f, indent=4)
+            print(f"Best metrics saved to {self.config.paths.val_eval}")
+

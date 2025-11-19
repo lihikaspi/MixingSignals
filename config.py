@@ -60,6 +60,7 @@ class PathsConfig:
     train_set_file: str = field(init=False)
     val_set_file: str = field(init=False)
     test_set_file: str = field(init=False)
+
     cold_start_songs_file: str = field(init=False)
     filtered_audio_embed_file: str = field(init=False)
     filtered_user_embed_file: str = field(init=False)
@@ -67,9 +68,13 @@ class PathsConfig:
     filtered_user_ids: str = field(init=False)
     popular_song_ids: str = field(init=False)
     positive_interactions_file: str = field(init=False)
+    negative_train_in_graph_file: str = field(init=False)
+    negative_train_cold_start_file: str = field(init=False)
+
     train_edges_file: str = field(init=False)
     train_graph_file: str = field(init=False)
     test_graph_file: str = field(init=False)
+
     val_scores_file: str = field(init=False)
     test_scores_file: str = field(init=False)
 
@@ -85,6 +90,8 @@ class PathsConfig:
     gnn_song_ids: str = field(init=False)
     content_index: str = field(init=False)
     content_song_ids: str = field(init=False)
+    cf_index: str = field(init=False)
+    cf_song_ids: str = field(init=False)
 
     test_eval: str = field(init=False)
     val_eval: str = field(init=False)
@@ -125,6 +132,8 @@ class PathsConfig:
         self.filtered_user_ids = f"{self.processed_dir}/filtered_user_ids.npy"
         self.popular_song_ids = f"{self.processed_dir}/popular_song_ids.npy"
         self.positive_interactions_file = f"{self.processed_dir}/positive_interactions.parquet"
+        self.negative_train_in_graph_file = f"{self.processed_dir}/neg_train_in_graph.parquet"
+        self.negative_train_cold_start_file = f"{self.processed_dir}/neg_train_cold_start.parquet"
 
         self.train_edges_file = f"{self.processed_dir}/train_edges.parquet"
         self.train_graph_file = f"{self.processed_dir}/train_graph.pt"
@@ -156,6 +165,8 @@ class PathsConfig:
         self.gnn_song_ids = f"{self.ann_models_dir}/gnn_song_ids.npy"
         self.content_index = f"{self.ann_models_dir}/content_index.faiss"
         self.content_song_ids = f"{self.ann_models_dir}/content_song_ids.npy"
+        self.cf_index = f"{self.ann_models_dir}/cf_index.faiss"
+        self.cf_song_ids = f"{self.ann_models_dir}/cf_song_ids.npy"
 
         self.test_eval = f"{self.eval_dir}/gnn_test_eval.txt"
         self.val_eval = f"{self.eval_dir}/gnn_val_eval.txt"
@@ -180,7 +191,7 @@ class PreprocessingConfig:
         "like": 1.0,
         "dislike": -1.0,
         "unlike": -0.5,
-        "undislike": 0.5
+        "undislike": 0.3
     })
     split_ratios: Dict[str, float] = field(default_factory=lambda: {
         "train": 0.8,
@@ -188,8 +199,8 @@ class PreprocessingConfig:
         "test": 0.1
     })
     novelty = {
-        "unseen_boost": 0.35,  # extra multiplier for songs never seen
-        "train_penalty": 0.20,  # how hard we penalise over-played songs
+        "unseen_boost": 0.20,  # extra multiplier for songs never seen
+        "train_penalty": 0.05,  # how hard we penalise over-played songs
         "recency_beta": 0.0001,  # exponential decay of recency penalty
         "max_familiarity": 20,  # denominator for familiarity normalisation
     }
@@ -202,33 +213,42 @@ class PreprocessingConfig:
 class GNNConfig:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    edge_attr_indices: Dict[str, int] = field(default_factory=lambda: {
+        "type": 0,
+        "count": 1,
+        "ratio": 2,
+        "weight": 3  # The heuristic weight
+    })
+
     embed_dim: int = 128
-    num_layers: int = 3
+    num_layers: int = 5
     lambda_align: float = 0.0
-    freeze_audio: bool = True
     audio_lr_scale: float = 0.1
 
     edge_mlp_hidden_dim: int = 8
     edge_mlp_input_dim: int = 4
 
     listen_weight: float = 0.8
-    neutral_neg_weight: float = 0.1
+    neutral_neg_weight: float = 0.31
 
-    lr: float = 0.01
+    lr: float = 0.07
     lr_decay: float = 0.98
-    momentum: float = 0.0
+    momentum: float = 0.9
     max_grad_norm: float = 1.0
     init_std: float = 0.005
 
     num_epochs: int = 50
-    batch_size: int = 16
-    weight_decay: float = 1e-5
-    num_workers: int = 16
+    batch_size: int = 256
+    weight_decay: float = 4e-6
+    num_workers: int = 8
     eval_every: int = 5
-    neg_samples_per_pos: int = 5
-    accum_steps: int = 8
-    audio_scale: float = 0.3
-    metadata_scale: float = 0.418
+    neg_samples_per_pos: int = 3
+    accum_steps: int = 1
+    audio_scale: float = 0.5
+    metadata_scale: float = 30.0
+    dropout: float = 0.005
+    margin: float = 0.3
+    max_patience: int = 5
 
     eval_batch_size: int = 512
 
