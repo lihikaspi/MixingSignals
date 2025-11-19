@@ -43,7 +43,7 @@ class ANNIndex:
         self.song_ids = audio_data['item_id'].to_numpy()
         self.song_embs = np.vstack(audio_data['normalized_embed'].to_numpy()).astype('float32')
 
-        print(f"Loaded {len(self.user_embs)} users and {len(self.song_embs)} songs.")
+        print(f"{self.index_type} index: Loaded {len(self.user_embs)} users and {len(self.song_embs)} songs.")
 
 
     def _load_gnn_embeddings(self):
@@ -67,7 +67,7 @@ class ANNIndex:
         self.song_embs = np.vstack([song_embs_gnn, song_embs_audio])
         self.song_ids = np.concatenate([song_ids_gnn, song_ids_audio])
 
-        print(f"Loaded {len(self.user_embs)} users and {len(self.song_embs)} songs.")
+        print(f"{self.index_type} index: Loaded {len(self.user_embs)} users and {len(self.song_embs)} songs.")
 
 
     def load_embeddings(self):
@@ -91,13 +91,13 @@ class ANNIndex:
         quantizer = faiss.IndexFlatIP(d)
         self.index = faiss.IndexIVFFlat(quantizer, d, self.nlist, faiss.METRIC_INNER_PRODUCT)
 
-        print("Training FAISS IVF index...")
+        print(f"Started training FAISS IVF {self.index_type} index")
         self.index.train(self.song_embs)
         print("Adding embeddings to index...")
         self.index.add(self.song_embs)
 
         self.index.nprobe = self.nprobe
-        print(f"Index built: ntotal={self.index.ntotal}, nlist={self.nlist}, nprobe={self.nprobe}")
+        print(f"    > Index built: ntotal={self.index.ntotal}, nlist={self.nlist}, nprobe={self.nprobe}")
 
 
     def save(self):
@@ -143,4 +143,5 @@ class ANNIndex:
         self.build_index()
         self.save()
         results, _ = self.recommend(self.top_k)
+        print()
         return results

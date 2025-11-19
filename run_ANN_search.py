@@ -15,7 +15,7 @@ def check_prev_files():
     """
     needed = [config.paths.user_embeddings_gnn, config.paths.song_embeddings_gnn,
               config.paths.cold_start_songs_file, config.paths.filtered_audio_embed_file,
-              config.paths.filtered_user_embed_file, config.paths.filtered_songs_id,
+              config.paths.filtered_user_embed_file, config.paths.filtered_song_ids,
               config.paths.filtered_user_ids, config.paths.popular_song_ids,
               config.paths.positive_interactions_file]
     fail = False
@@ -30,6 +30,7 @@ def check_prev_files():
 
 
 def recommend_popular():
+    print("\nmaking popularity-based recommendations ")
     song_ids = np.load(config.paths.popular_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)
     top_k_ids = song_ids[config.ann.top_k:]
@@ -40,7 +41,8 @@ def recommend_popular():
 
 
 def recommend_random():
-    song_ids = np.load(config.paths.filtered_songs_id)
+    print("\nmaking random recommendations ")
+    song_ids = np.load(config.paths.filtered_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)
     num_users = len(user_ids)
     num_songs = len(song_ids)
@@ -52,6 +54,7 @@ def recommend_random():
 
 
 def recommend_cf(top_k=10, top_sim_items=50):
+    print("\nmaking content-based recommendations ")
     """
     Memory-friendly item-based CF using sparse operations.
     Returns a dict: {user_id: [song_id1, song_id2, ...], ...}
@@ -62,7 +65,7 @@ def recommend_cf(top_k=10, top_sim_items=50):
 
     # ---- Step 2: Load user and song IDs ----
     user_ids = np.load(config.paths.filtered_user_ids)
-    song_ids = np.load(config.paths.filtered_songs_id)
+    song_ids = np.load(config.paths.filtered_song_ids)
 
     user_to_idx = {u: i for i, u in enumerate(user_ids)}
     idx_to_user = {i: u for i, u in enumerate(user_ids)}

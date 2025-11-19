@@ -18,7 +18,7 @@ def objective(trial):
         neg_samples_per_pos = trial.suggest_int("neg_samples_per_pos", 2, 6)
 
         # Best listen_weight: 0.8. Let's search around it.
-        listen_weight = trial.suggest_float("listen_weight", 0.6, 1.0)
+        # listen_weight = trial.suggest_float("listen_weight", 0.6, 1.0)
 
         # Best neutral_neg_weight: 0.5. Let's search around it.
         neutral_neg_weight = trial.suggest_float("neutral_neg_weight", 0.3, 0.7)
@@ -44,7 +44,7 @@ def objective(trial):
         # --- APPLY ALL SUGGESTED PARAMS ---
         config.gnn.lr = lr
         config.gnn.neg_samples_per_pos = neg_samples_per_pos
-        config.gnn.listen_weight = listen_weight
+        # config.gnn.listen_weight = listen_weight
         config.gnn.neutral_neg_weight = neutral_neg_weight
         config.gnn.num_layers = num_layers
         config.gnn.weight_decay = weight_decay
@@ -69,7 +69,7 @@ def objective(trial):
 
         metric = trainer.best_ndcg
 
-	# Check if the metrics dict exists and save it
+        # Check if the metrics dict exists and save it
         if hasattr(trainer, 'best_metrics'):
             # Ensure metrics are JSON-serializable (convert tensors/numpy to float)
             serializable_metrics = {k: (v.item() if hasattr(v, 'item') else v)
