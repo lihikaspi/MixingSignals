@@ -240,7 +240,6 @@ class EventProcessor:
         self.con.execute(f"COPY (SELECT * FROM cold_start_songs) TO '{self.cold_start_songs_path}' (FORMAT PARQUET)")
         print(f'Cold start songs file saved.')
 
-
     def _build_relevance_case_statement(self) -> str:
         """Constructs the SQL CASE statement for base relevance."""
         case_base = "CASE e.event_type\n"
@@ -293,16 +292,26 @@ class EventProcessor:
 
 
     def _create_final_score_table(self, split: str):
-        """Step 3: Apply novelty adjustment."""
+        """Step 3: Apply hybrid score adjustment (Current Event + Historical Boost)."""
         n = self.novelty
+        # Use train_penalty (0.05) as the boost weight.
+        boost_weight = n['train_penalty']
+        max_fam = n['max_familiarity']
+
         query = f"""
             CREATE TEMPORARY TABLE {split}_final AS
             SELECT
                 user_id, item_id, base_relevance, total_events, seen_in_train, train_play_cnt,
-                (CASE WHEN seen_in_train = 0 THEN {n['unseen_boost']} ELSE 0 END)
-                - {n['train_penalty']} * LEAST(train_play_cnt, {n['max_familiarity']}) / {n['max_familiarity']}
-                AS novelty_factor,
-                (base_relevance * (1 + novelty_factor))^2 AS adjusted_score
+                -- Historical Boost Factor: Rewards songs played more in the previous split
+                {boost_weight} * LEAST(train_play_cnt, {max_fam}) / {max_fam}
+                AS historical_boost_factor,
+                -- New Hybrid Score: (Current Relevance) * (1 + Historical Boost Factor)
+                -- Current Relevance (base_relevance) is the main driver (high emphasis on current split)
+                -- Score is kept linear (no square) and clamped to a max of 1.0.
+                LEAST(
+                    base_relevance * (1 + historical_boost_factor),
+                    1.0
+                ) AS adjusted_score
             FROM {split}_scores
         """
         self.con.execute(query)
@@ -446,4 +455,3 @@ class EventProcessor:
         self._save_positive_interactions()
         self._compute_user_avg_embeddings()
         print("Baseline files prepared.")
-

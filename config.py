@@ -189,8 +189,8 @@ class PreprocessingConfig:
     weights: Dict[str, float] = field(default_factory=lambda: {
         "listen": 0.7,
         "like": 1.0,
-        "dislike": -1.0,
-        "unlike": -0.5,
+        "dislike": 0,
+        "unlike": 0,
         "undislike": 0.3
     })
     split_ratios: Dict[str, float] = field(default_factory=lambda: {
