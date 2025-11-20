@@ -52,6 +52,8 @@ class GNNEvaluator:
                 "item_idx": group["item_idx"].values,  # Original IDs
                 "adjusted_score": group["adjusted_score"].values,
                 "base_relevance": group["base_relevance"].values,
+                "listen_plus_relevance": group["listen_plus_relevance"].values,
+                "like_relevance": group["like_relevance"].values,
                 "seen_in_train": group["seen_in_train"].values.astype(bool)
             }
 
@@ -105,6 +107,8 @@ class GNNEvaluator:
             gt["graph_idx"] = np.array(graph_indices, dtype=np.int64)
             gt["valid_adj_scores"] = gt["adjusted_score"][valid_indices]
             gt["valid_base_rel"] = gt["base_relevance"][valid_indices]
+            gt["valid_listen_plus_rel"] = gt["listen_plus_relevance"][valid_indices]
+            gt["valid_like_rel"] = gt["like_relevance"][valid_indices]
             gt["valid_seen"] = gt["seen_in_train"][valid_indices]
 
 
@@ -165,6 +169,8 @@ class GNNEvaluator:
         gt_items = gt["graph_idx"]
         gt_adj = gt["valid_adj_scores"]
         gt_base = gt["valid_base_rel"]
+        gt_listen_plus = gt["valid_listen_plus_rel"]
+        gt_like = gt["valid_like_rel"]
 
         topk_set = set(topk_idx)
         metrics = {}
@@ -172,6 +178,8 @@ class GNNEvaluator:
         # 1. NDCG (Adjusted & Raw)
         metrics["ndcg@k"] = self._calc_ndcg(topk_idx, gt_items, gt_adj)
         metrics["ndcg_raw@k"] = self._calc_ndcg(topk_idx, gt_items, gt_base)
+        metrics["ndcg_listen_plus@k"] = self._calc_ndcg(topk_idx, gt_items, gt_listen_plus)
+        metrics["ndcg_like@k"] = self._calc_ndcg(topk_idx, gt_items, gt_like)
 
         # 2. Hits
         # Hit Like (Explicit > 1.0)
@@ -232,7 +240,8 @@ class GNNEvaluator:
 
         # 2. Accumulate Results
         agg_metrics = {
-            "ndcg@k": [], "ndcg_raw@k": [], "hit_like@k": [],
+            "ndcg@k": [], "ndcg_raw@k": [],
+            "ndcg_listen_plus@k": [], "ndcg_like@k": [], "hit_like@k": [],
             "hit_like_listen@k": [], "auc": [], "dislike_fpr@k": [], "novelty@k": []
         }
 

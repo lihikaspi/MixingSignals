@@ -40,7 +40,9 @@ class RecEvaluator:
             gt_lookup[uid] = {
                 "items": group["item_idx"].values,
                 "adj": group["adjusted_score"].values,
-                "base": group["base_relevance"].values
+                "base": group["base_relevance"].values,
+                "listen_plus": group["listen_plus_relevance"].values,
+                "like": group["like_relevance"].values
             }
         print(f"Loaded ground truth for {len(gt_lookup)} users.")
         return gt_lookup
@@ -117,7 +119,9 @@ class RecEvaluator:
 
         per_user_metrics = {}
         all_metrics = {
-            "ndcg@k": [], "ndcg_raw@k": [], "hit_like@k": [],
+            "ndcg@k": [], "ndcg_raw@k": [],
+            "ndcg_listen_plus@k": [], "ndcg_like@k": [], # ADDED
+            "hit_like@k": [],
             "hit_like_listen@k": [], "auc": [], "dislike_fpr@k": [], "novelty@k": []
         }
 
@@ -137,6 +141,8 @@ class RecEvaluator:
             gt_items = gt_data["items"]
             gt_adj = gt_data["adj"]
             gt_base = gt_data["base"]
+            gt_listen_plus = gt_data["listen_plus"]
+            gt_like = gt_data["like"]
 
             # --- DEBUGGING FIRST MATCH ---
             if not debug_printed:
@@ -157,10 +163,18 @@ class RecEvaluator:
             relevance_base = np.zeros(max_item_idx, dtype=float)
             relevance_base[gt_items] = gt_base
 
+            relevance_listen_plus = np.zeros(max_item_idx, dtype=float)  # ADDED
+            relevance_listen_plus[gt_items] = gt_listen_plus  # ADDED
+
+            relevance_like = np.zeros(max_item_idx, dtype=float)  # ADDED
+            relevance_like[gt_items] = gt_like  # ADDED
+
             user_metrics = {}
 
             user_metrics["ndcg@k"] = self._calc_ndcg(topk_idx, relevance_adj, gt_adj, k)
             user_metrics["ndcg_raw@k"] = self._calc_ndcg(topk_idx, relevance_base, gt_base, k)
+            user_metrics["ndcg_listen_plus@k"] = self._calc_ndcg(topk_idx, relevance_listen_plus, gt_listen_plus, k)
+            user_metrics["ndcg_like@k"] = self._calc_ndcg(topk_idx, relevance_like, gt_like, k)
 
             like_items = gt_items[gt_adj > 1.0]
             user_metrics["hit_like@k"] = float(len(set(like_items) & topk_set) > 0)
