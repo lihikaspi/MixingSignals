@@ -245,7 +245,7 @@ class EventProcessor:
         case_base = "CASE e.event_type\n"
         for etype, weight in self.weight.items():
             if etype == "listen":
-                case_base += f"    WHEN '{etype}' THEN {weight} * ((COALESCE(e.played_ratio_pct,0)/100.0))\n"
+                case_base += f"    WHEN '{etype}' THEN {weight} * (LEAST(COALESCE(e.played_ratio_pct,0), 100.0) / 100.0)\n"
             else:
                 case_base += f"    WHEN '{etype}' THEN {weight}\n"
         case_base += "    ELSE 0.0 END"

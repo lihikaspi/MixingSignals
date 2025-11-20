@@ -28,6 +28,7 @@ class BPRDataset(Dataset):
         self.neutral_neg_weight = config.gnn.neutral_neg_weight
         self.neg_samples_per_pos = config.gnn.neg_samples_per_pos
         self.edge_type_mapping = config.preprocessing.edge_type_mapping
+        self.min_listen_weight = config.gnn.min_listen_weight
 
         # Process graph data
         self.user2pos, self.user2pos_ratios, self.all_users_pos_sets = self._process_graph_edges(train_graph)
@@ -58,10 +59,17 @@ class BPRDataset(Dataset):
 
         pos_types = [self.edge_type_mapping[k] for k in ["listen", "like", "undislike"]]
 
+
         for u, i, t, r in zip(edge_index[0].tolist(), edge_index[1].tolist(), types.tolist(), ratios.tolist()):
             if int(round(t)) in pos_types:
+
+                if int(round(t)) == self.edge_type_mapping["listen"]:
+                    final_weight = self.min_listen_weight + (1.0 - self.min_listen_weight) * max(0.0, min(r, 1.0))
+                else:
+                    final_weight = r
+
                 user2pos[u].append(i)
-                user2pos_ratios[u].append(r)
+                user2pos_ratios[u].append(final_weight)
                 pos_sets[u].add(i)
 
         return user2pos, user2pos_ratios, pos_sets

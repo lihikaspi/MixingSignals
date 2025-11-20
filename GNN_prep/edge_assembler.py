@@ -51,7 +51,7 @@ class EdgeAssembler:
                 {case_event_type},
                 AVG(
                     CASE 
-                        WHEN e.event_type = 'listen' THEN e.played_ratio_pct / 100.0
+                        WHEN e.event_type = 'listen' THEN LEAST(e.played_ratio_pct, 100.0) / 100.0
                         WHEN e.event_type = 'like' THEN 1
                         WHEN e.event_type = 'dislike' THEN 0
                         ELSE 0.5
