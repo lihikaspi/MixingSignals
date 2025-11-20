@@ -192,6 +192,7 @@ class GNNTrainer:
 
         self.step_count = 0
         self.warmup_steps = len(self.loader)
+        self.lr_cycle = config.gnn.lr_cycle
 
         # Metrics tracking
         self.best_ndcg = 0.0
@@ -241,8 +242,8 @@ class GNNTrainer:
             return self.lr_base * (
                     self.step_count / self.warmup_steps) if self.step_count > 0 else self.lr_base / self.warmup_steps
 
-        cycle_epoch = (epoch - (self.warmup_steps / len(self.loader))) % 3
-        return 1e-6 + (self.lr_base - 1e-6) * (1 + math.cos(math.pi * cycle_epoch / 3)) / 2
+        cycle_epoch = (epoch - (self.warmup_steps / len(self.loader))) % self.lr_cycle
+        return 1e-6 + (self.lr_base - 1e-6) * (1 + math.cos(math.pi * cycle_epoch / self.lr_cycle)) / 2
 
 
     def _update_parameters(self, lr):

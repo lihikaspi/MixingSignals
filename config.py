@@ -231,8 +231,9 @@ class GNNConfig:
     neutral_neg_weight: float = 0.31
     min_listen_weight: float = 0.3
 
-    lr: float = 0.07
+    lr: float = 0.03
     lr_decay: float = 0.98
+    lr_cycle: int = 5
     momentum: float = 0.9
     max_grad_norm: float = 1.0
     init_std: float = 0.005
