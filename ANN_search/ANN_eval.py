@@ -39,10 +39,10 @@ class RecEvaluator:
         for uid, group in df.groupby("user_idx"):
             gt_lookup[uid] = {
                 "items": group["item_idx"].values,
-                "adj": group["adjusted_score"].values,
-                "base": group["base_relevance"].values,
-                "listen_plus": group["listen_plus_relevance"].values,
-                "like": group["like_relevance"].values
+                "adj": group["adjusted_score"].values.astype(float),
+                "base": group["base_relevance"].values.astype(float),
+                "listen_plus": group["listen_plus_relevance"].values.astype(float),
+                "like": group["like_relevance"].values.astype(float)
             }
         print(f"Loaded ground truth for {len(gt_lookup)} users.")
         return gt_lookup
@@ -205,3 +205,8 @@ class RecEvaluator:
             "per_user": per_user_metrics,
             "avg": avg_metrics
         }
+
+    def eval(self):
+        """Main evaluation wrapper."""
+        self._eval_gnn_recs()
+        self._eval_baselines()

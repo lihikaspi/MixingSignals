@@ -229,7 +229,7 @@ class GNNConfig:
     edge_mlp_input_dim: int = 4
 
     neutral_neg_weight: float = 0.31
-    min_listen_weight: float = 0.2
+    min_listen_weight: float = 0.3
 
     lr: float = 0.07
     lr_decay: float = 0.98

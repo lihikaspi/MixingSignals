@@ -80,7 +80,7 @@ class EventProcessor:
             )
             SELECT e.*, u.user_id
             FROM filtered_events e
-                JOIN user_index u USING (uid) 
+                JOIN user_index u USING (uid)
         """
         self.con.execute(query)
         print("Created user indices")
@@ -222,23 +222,43 @@ class EventProcessor:
     # ---------------------------------------------------------
 
     def _save_cold_start_songs(self):
-        """Identifies and saves songs present in Test but missing from Train/Val."""
-        # Identify test items
-        self.con.execute(
-            "CREATE TEMPORARY TABLE test_items AS SELECT DISTINCT item_id FROM split_data WHERE split = 'test'")
+        """
+        Identifies and saves 'Cold Start' songs.
+        Definition: Songs present in the dataset but NOT in the Positive Training Graph.
 
-        # Find cold start items and fetch embeddings
+        This includes:
+        1. Songs that only appear in Validation or Test splits.
+        2. Songs that are in the Train split but ONLY have negative interactions (dislike/unlike).
+        """
+
+        # 1. Identify items that will actually be nodes in the GNN (Positive Train Interactions)
+        self.con.execute("""
+                         CREATE
+                         TEMPORARY TABLE IF NOT EXISTS train_graph_items_lookup AS
+                         SELECT DISTINCT item_id
+                         FROM split_data
+                         WHERE split = 'train'
+                           AND event_type IN ('listen', 'like', 'undislike')
+                         """)
+
+        # 2. Select items that are in the full dataset but NOT in the GNN graph
         self.con.execute(f"""
             CREATE TEMPORARY TABLE cold_start_songs AS
-            SELECT d.item_id, emb.normalized_embed
+            SELECT DISTINCT d.item_id, emb.normalized_embed
             FROM split_data d
             LEFT JOIN read_parquet('{self.embeddings_path}') emb ON d.item_id = emb.item_id
-            LEFT JOIN test_items t ON d.item_id = t.item_id
-            WHERE d.split IN ('train', 'val') AND t.item_id IS NULL
+            LEFT JOIN train_graph_items_lookup t ON d.item_id = t.item_id
+            WHERE t.item_id IS NULL  -- Keeps items NOT in the positive train graph
+              AND d.item_id IS NOT NULL
+              AND emb.normalized_embed IS NOT NULL
         """)
 
         self.con.execute(f"COPY (SELECT * FROM cold_start_songs) TO '{self.cold_start_songs_path}' (FORMAT PARQUET)")
-        print(f'Cold start songs file saved.')
+        print(f'Cold start songs file saved (Items not in Positive Train Graph).')
+
+        # Cleanup
+        self.con.execute("DROP TABLE IF EXISTS train_graph_items_lookup")
+
 
     def _build_relevance_case_statement(self) -> str:
         """Constructs the SQL CASE statement for base relevance."""
@@ -250,6 +270,7 @@ class EventProcessor:
                 case_base += f"    WHEN '{etype}' THEN {weight}\n"
         case_base += "    ELSE 0.0 END"
         return case_base
+
 
     def _create_raw_split_table(self, split: str, case_base: str):
         """Step 1: Create event-level scores."""
@@ -351,6 +372,7 @@ class EventProcessor:
         self.con.execute(f"DROP TABLE {split}_raw")
         self.con.execute(f"DROP TABLE {split}_scores")
         self.con.execute(f"DROP TABLE {split}_final")
+
 
     def _compute_relevance_scores(self):
         """Computes scores for both Val and Test splits."""

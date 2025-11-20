@@ -50,10 +50,10 @@ class GNNEvaluator:
         for uid, group in df.groupby('user_idx'):
             self.ground_truth[uid] = {
                 "item_idx": group["item_idx"].values,  # Original IDs
-                "adjusted_score": group["adjusted_score"].values,
-                "base_relevance": group["base_relevance"].values,
-                "listen_plus_relevance": group["listen_plus_relevance"].values,
-                "like_relevance": group["like_relevance"].values,
+                "adjusted_score": group["adjusted_score"].values.astype(float),
+                "base_relevance": group["base_relevance"].values.astype(float),
+                "listen_plus_relevance": group["listen_plus_relevance"].values.astype(float),
+                "like_relevance": group["like_relevance"].values.astype(float),
                 "seen_in_train": group["seen_in_train"].values.astype(bool)
             }
 
@@ -183,7 +183,7 @@ class GNNEvaluator:
 
         # 2. Hits
         # Hit Like (Explicit > 1.0)
-        like_items = gt_items[gt_adj > 1.0]
+        like_items = gt_items[gt_adj >= 1.0]
         metrics["hit_like@k"] = float(len(set(like_items) & topk_set) > 0)
 
         # Hit Like+Listen (Implicit > 0.5)
@@ -271,4 +271,3 @@ class GNNEvaluator:
         print(">>> Evaluation complete.")
         final_results = {m: float(np.mean(v)) if len(v) else 0.0 for m, v in agg_metrics.items()}
         return final_results
-

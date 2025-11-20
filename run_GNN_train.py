@@ -55,7 +55,7 @@ def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path
     """
     Saves final user and song embeddings to disk.
     """
-    print("Starting to save final embeddings...")
+    print("\nSaving final user and song embeddings")
     torch.cuda.empty_cache()
     model.eval()
 
@@ -63,7 +63,7 @@ def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path
         # Call the new CPU-based forward method.
         user_emb, item_emb, _ = model.forward_cpu()
 
-        print("Converting final embeddings to NumPy...")
+        # print("Converting final embeddings to NumPy...")
         user_emb_np = user_emb.numpy().astype(np.float32)
         item_emb_np = item_emb.numpy().astype(np.float32)
 
@@ -76,16 +76,16 @@ def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path
         item_ids_np = model.item_original_ids.cpu().numpy()
 
         # Save to .npz files
-        print(f"Saving user embeddings to {user_embed_path}...")
+        # print(f"Saving user embeddings to {user_embed_path}...")
         np.savez(user_embed_path, embeddings=user_emb_np, original_ids=user_ids_np)
 
-        print(f"Saving song embeddings to {song_embed_path}...")
+        # print(f"Saving song embeddings to {song_embed_path}...")
         np.savez(song_embed_path, embeddings=item_emb_np, original_ids=item_ids_np)
 
     print("-------------------------------------------------")
     print(f"User embeddings saved to {user_embed_path}")
     print(f"Song embeddings saved to {song_embed_path}")
-    print("Embedding saving process complete.")
+    # print("Embedding saving process complete.")
 
 
 def main():
