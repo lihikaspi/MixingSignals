@@ -196,7 +196,7 @@ class GNNEvaluator:
         # 5. AUC (Positive vs Negative discrimination)
         # Using adjusted score to define pos (>0) vs neg (<0)
         pos_mask = gt_adj > 0
-        neg_mask = gt_adj < 0
+        neg_mask = gt_adj <= 0
 
         metrics["auc"] = np.nan  # Default if cannot calc
         if np.any(pos_mask) and np.any(neg_mask):
