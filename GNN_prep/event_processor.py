@@ -251,14 +251,22 @@ class EventProcessor:
         case_base += "    ELSE 0.0 END"
         return case_base
 
-
     def _create_raw_split_table(self, split: str, case_base: str):
         """Step 1: Create event-level scores."""
+
         query = f"""
             CREATE TEMPORARY TABLE {split}_raw AS
             SELECT
                 e.user_id, e.item_id, e.timestamp,
                 ( {case_base} ) AS base_relevance,
+                CASE 
+                    WHEN e.event_type = 'listen' AND COALESCE(e.played_ratio_pct, 0) > 50.0 THEN 1.0
+                    ELSE 0.0
+                END AS listen_plus_relevance,
+                CASE 
+                    WHEN e.event_type = 'like' THEN 1.0
+                    ELSE 0.0
+                END AS like_relevance,
                 1 AS n_events,
                 COALESCE(t.play_cnt,0) AS train_play_cnt,
                 COALESCE(t.seen_in_train,0) AS seen_in_train
@@ -281,6 +289,8 @@ class EventProcessor:
             SELECT
                 user_id, item_id,
                 SUM(base_relevance) AS base_relevance,
+                SUM(listen_plus_relevance) AS listen_plus_relevance, -- ADDED
+                SUM(like_relevance) AS like_relevance,               -- ADDED
                 SUM(n_events) AS total_events,
                 MAX(seen_in_train) AS seen_in_train,
                 MAX(train_play_cnt) AS train_play_cnt,
@@ -301,7 +311,7 @@ class EventProcessor:
         query = f"""
             CREATE TEMPORARY TABLE {split}_final AS
             SELECT
-                user_id, item_id, base_relevance, total_events, seen_in_train, train_play_cnt,
+                user_id, item_id, base_relevance, listen_plus_relevance, like_relevance, total_events, seen_in_train, train_play_cnt,
                 -- Historical Boost Factor: Rewards songs played more in the previous split
                 {boost_weight} * LEAST(train_play_cnt, {max_fam}) / {max_fam}
                 AS historical_boost_factor,
@@ -329,6 +339,7 @@ class EventProcessor:
         export_query = f"""
             COPY (
                 SELECT user_id, item_id, base_relevance, adjusted_score, 
+                       listen_plus_relevance, like_relevance,
                        total_events, seen_in_train, train_play_cnt 
                 FROM {split}_final
             ) TO '{out_path}' (FORMAT PARQUET)

@@ -39,6 +39,8 @@ def test_evaluation(model: LightGCN, train_graph: HeteroData):
     print(f"Test set metrics @K={k_hit}:")
     print(f"  NDCG@{k_hit}: {test_metrics['ndcg@k']:.4f}")
     print(f"  NDCG_raw@{k_hit}: {test_metrics['ndcg_raw@k']:.4f}")
+    print(f"  NDCG_Listen+@{k_hit}: {test_metrics['ndcg_listen_plus@k']:.4f}")
+    print(f"  NDCG_Like@{k_hit}: {test_metrics['ndcg_like@k']:.4f}")
     print(f"  Hit@{k_hit} (like only): {test_metrics['hit_like@k']:.4f}")
     print(f"  Hit@{k_hit} (like+listen): {test_metrics['hit_like_listen@k']:.4f}")
     print(f"  AUC: {test_metrics['auc']:.4f}")
