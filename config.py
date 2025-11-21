@@ -70,6 +70,7 @@ class PathsConfig:
     positive_interactions_file: str = field(init=False)
     negative_train_in_graph_file: str = field(init=False)
     negative_train_cold_start_file: str = field(init=False)
+    user_mapping: str = field(init=False)
 
     train_edges_file: str = field(init=False)
     train_graph_file: str = field(init=False)
@@ -134,6 +135,7 @@ class PathsConfig:
         self.positive_interactions_file = f"{self.processed_dir}/positive_interactions.parquet"
         self.negative_train_in_graph_file = f"{self.processed_dir}/neg_train_in_graph.parquet"
         self.negative_train_cold_start_file = f"{self.processed_dir}/neg_train_cold_start.parquet"
+        self.user_mapping = f"{self.processed_dir}/user_mapping.parquet"
 
         self.train_edges_file = f"{self.processed_dir}/train_edges.parquet"
         self.train_graph_file = f"{self.processed_dir}/train_graph.pt"

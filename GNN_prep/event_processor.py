@@ -3,6 +3,7 @@ from typing import Dict
 from config import Config
 import numpy as np
 import pandas as pd
+import os
 
 
 class EventProcessor:
@@ -13,6 +14,7 @@ class EventProcessor:
 
     def __init__(self, con: duckdb.DuckDBPyConnection, config: Config):
         self.con = con
+        self.config = config
 
         self.embeddings_path = config.paths.audio_embeddings_file
         self.multi_event_path = config.paths.raw_multi_event_file
@@ -28,6 +30,7 @@ class EventProcessor:
         self.negative_train_in_graph_file = config.paths.negative_train_in_graph_file
         self.negative_train_cold_start_file = config.paths.negative_train_cold_start_file
         self.split_paths = config.paths.split_paths
+        self.user_mapping = config.paths.user_mapping
 
         self.low_threshold = config.preprocessing.low_interaction_threshold
         self.high_threshold = config.preprocessing.high_interaction_threshold
@@ -144,7 +147,7 @@ class EventProcessor:
 
 
     def _remove_neg_train_edges(self):
-        """Filters out negative interactions from the training set (used for graph construction)."""
+        """Filters out negative interactions from the training set."""
         query = """
                 CREATE \
                 TEMPORARY TABLE no_neg_train_events AS
@@ -161,14 +164,11 @@ class EventProcessor:
     # ---------------------------------------------------------
 
     def _create_negative_event_tables(self, split: str = 'train'):
-        """Creates temporary tables for negative events and train items."""
-        # 1. Identify all items present in the training set
         self.con.execute("""
             CREATE TEMPORARY TABLE train_set_items AS
             SELECT DISTINCT item_id FROM split_data WHERE split = 'train'
         """)
 
-        # 2. Isolate negative events
         self.con.execute(f"""
             CREATE TEMPORARY TABLE neg_events AS
             SELECT DISTINCT uid, user_id, item_id, event_type
@@ -179,7 +179,6 @@ class EventProcessor:
 
 
     def _save_in_graph_negatives(self):
-        """Saves negatives where the item IS in the training graph (lightweight)."""
         query = f"""
             COPY (
                 SELECT neg.user_id, neg.item_id
@@ -192,7 +191,6 @@ class EventProcessor:
 
 
     def _save_cold_start_negatives(self):
-        """Saves negatives where the item IS NOT in the training graph (heavy, needs embeddings)."""
         query = f"""
             COPY (
                 SELECT neg.user_id, neg.item_id, emb.normalized_embed
@@ -207,13 +205,10 @@ class EventProcessor:
 
 
     def _save_neg_interactions(self):
-        """Coordinator for processing negative interactions."""
         print(f"Splitting negative 'train' interactions...")
         self._create_negative_event_tables(split='train')
         self._save_in_graph_negatives()
         self._save_cold_start_negatives()
-
-        # Cleanup temp tables if needed, though DuckDB handles temp tables per connection
         self.con.execute("DROP TABLE IF EXISTS train_set_items")
         self.con.execute("DROP TABLE IF EXISTS neg_events")
 
@@ -222,16 +217,6 @@ class EventProcessor:
     # ---------------------------------------------------------
 
     def _save_cold_start_songs(self):
-        """
-        Identifies and saves 'Cold Start' songs.
-        Definition: Songs present in the dataset but NOT in the Positive Training Graph.
-
-        This includes:
-        1. Songs that only appear in Validation or Test splits.
-        2. Songs that are in the Train split but ONLY have negative interactions (dislike/unlike).
-        """
-
-        # 1. Identify items that will actually be nodes in the GNN (Positive Train Interactions)
         self.con.execute("""
                          CREATE
                          TEMPORARY TABLE IF NOT EXISTS train_graph_items_lookup AS
@@ -241,27 +226,23 @@ class EventProcessor:
                            AND event_type IN ('listen', 'like', 'undislike')
                          """)
 
-        # 2. Select items that are in the full dataset but NOT in the GNN graph
         self.con.execute(f"""
             CREATE TEMPORARY TABLE cold_start_songs AS
             SELECT DISTINCT d.item_id, emb.normalized_embed
             FROM split_data d
             LEFT JOIN read_parquet('{self.embeddings_path}') emb ON d.item_id = emb.item_id
             LEFT JOIN train_graph_items_lookup t ON d.item_id = t.item_id
-            WHERE t.item_id IS NULL  -- Keeps items NOT in the positive train graph
+            WHERE t.item_id IS NULL 
               AND d.item_id IS NOT NULL
               AND emb.normalized_embed IS NOT NULL
         """)
 
         self.con.execute(f"COPY (SELECT * FROM cold_start_songs) TO '{self.cold_start_songs_path}' (FORMAT PARQUET)")
-        print(f'Cold start songs file saved (Items not in Positive Train Graph).')
-
-        # Cleanup
+        print(f'Cold start songs file saved.')
         self.con.execute("DROP TABLE IF EXISTS train_graph_items_lookup")
 
 
     def _build_relevance_case_statement(self) -> str:
-        """Constructs the SQL CASE statement for base relevance."""
         case_base = "CASE e.event_type\n"
         for etype, weight in self.weight.items():
             if etype == "listen":
@@ -273,8 +254,6 @@ class EventProcessor:
 
 
     def _create_raw_split_table(self, split: str, case_base: str):
-        """Step 1: Create event-level scores."""
-
         query = f"""
             CREATE TEMPORARY TABLE {split}_raw AS
             SELECT
@@ -304,14 +283,13 @@ class EventProcessor:
 
 
     def _create_aggregated_score_table(self, split: str):
-        """Step 2: Aggregate scores per user-item."""
         query = f"""
             CREATE TEMPORARY TABLE {split}_scores AS
             SELECT
                 user_id, item_id,
                 SUM(base_relevance) AS base_relevance,
-                SUM(listen_plus_relevance) AS listen_plus_relevance, -- ADDED
-                SUM(like_relevance) AS like_relevance,               -- ADDED
+                SUM(listen_plus_relevance) AS listen_plus_relevance,
+                SUM(like_relevance) AS like_relevance,
                 SUM(n_events) AS total_events,
                 MAX(seen_in_train) AS seen_in_train,
                 MAX(train_play_cnt) AS train_play_cnt,
@@ -323,9 +301,7 @@ class EventProcessor:
 
 
     def _create_final_score_table(self, split: str):
-        """Step 3: Apply hybrid score adjustment (Current Event + Historical Boost)."""
         n = self.novelty
-        # Use train_penalty (0.05) as the boost weight.
         boost_weight = n['train_penalty']
         max_fam = n['max_familiarity']
 
@@ -333,12 +309,8 @@ class EventProcessor:
             CREATE TEMPORARY TABLE {split}_final AS
             SELECT
                 user_id, item_id, base_relevance, listen_plus_relevance, like_relevance, total_events, seen_in_train, train_play_cnt,
-                -- Historical Boost Factor: Rewards songs played more in the previous split
                 {boost_weight} * LEAST(train_play_cnt, {max_fam}) / {max_fam}
                 AS historical_boost_factor,
-                -- New Hybrid Score: (Current Relevance) * (1 + Historical Boost Factor)
-                -- Current Relevance (base_relevance) is the main driver (high emphasis on current split)
-                -- Score is kept linear (no square) and clamped to a max of 1.0.
                 LEAST(
                     base_relevance * (1 + historical_boost_factor),
                     1.0
@@ -349,14 +321,11 @@ class EventProcessor:
 
 
     def _process_split(self, split: str, out_path: str):
-        """Orchestrates the scoring pipeline for a specific split."""
         case_base = self._build_relevance_case_statement()
-
         self._create_raw_split_table(split, case_base)
         self._create_aggregated_score_table(split)
         self._create_final_score_table(split)
 
-        # Step 4: Export
         export_query = f"""
             COPY (
                 SELECT user_id, item_id, base_relevance, adjusted_score, 
@@ -368,28 +337,20 @@ class EventProcessor:
         self.con.execute(export_query)
         print(f"  > {split.capitalize()} scores processed and saved.")
 
-        # Cleanup
         self.con.execute(f"DROP TABLE {split}_raw")
         self.con.execute(f"DROP TABLE {split}_scores")
         self.con.execute(f"DROP TABLE {split}_final")
 
 
     def _compute_relevance_scores(self):
-        """Computes scores for both Val and Test splits."""
         print("Processing validation scores...")
         self._process_split('val', self.val_scores)
-
         print("Processing test scores...")
         self._process_split('test', self.test_scores)
 
-    # ---------------------------------------------------------
-    # 5. Main Pipeline Methods
-    # ---------------------------------------------------------
 
     def split_data(self, split_ratios: dict = None):
-        """Main entry point for splitting and processing pipeline."""
         if split_ratios is not None: self.split_ratios = split_ratios
-
         self._split_data()
         self._compute_relevance_scores()
         self._save_cold_start_songs()
@@ -401,10 +362,36 @@ class EventProcessor:
     # 6. Baseline Preparation (Helpers)
     # ---------------------------------------------------------
 
+    def _save_user_id_mapping(self):
+        """
+        Saves a mapping file: user_id (Encoded) <-> uid (Original).
+        Uses Union of all splits to ensure no users are missed.
+        """
+        query = f"""
+            CREATE OR REPLACE TEMPORARY TABLE all_users_union AS
+            SELECT uid, user_id FROM read_parquet('{self.split_paths['train']}')
+            UNION 
+            SELECT uid, user_id FROM read_parquet('{self.split_paths['val']}')
+            UNION 
+            SELECT uid, user_id FROM read_parquet('{self.split_paths['test']}')
+        """
+        self.con.execute(query)
+
+        self.con.execute(f"""
+            COPY (SELECT DISTINCT user_id, uid FROM all_users_union ORDER BY user_id) 
+            TO '{self.user_mapping}' (FORMAT PARQUET)
+        """)
+        print(f"Saved User ID Mapping (Encoded <-> Original) to {self.user_mapping}")
+
+        # Drop temp
+        self.con.execute("DROP TABLE all_users_union")
+
     def _save_filtered_user_ids(self):
+        # Save standard ENCODED ids for index compatibility
         query = f"SELECT DISTINCT user_id FROM read_parquet('{self.split_paths['train']}') ORDER BY user_id"
         df = self.con.execute(query).fetch_df()
         np.save(self.filtered_user_ids, df['user_id'].to_numpy(dtype=np.int64))
+        print(f"Saved filtered_user_ids.npy (Encoded IDs)")
 
 
     def _save_filtered_song_ids(self):
@@ -447,40 +434,47 @@ class EventProcessor:
 
 
     def _save_positive_interactions(self):
+        # UPDATED: Save BOTH 'user_id' (Encoded) and 'uid' (Original)
         query = f"""
             CREATE OR REPLACE TEMPORARY TABLE train_pos_interactions AS
-            SELECT DISTINCT user_id, item_id
+            SELECT DISTINCT user_id, uid, item_id
             FROM read_parquet('{self.split_paths['train']}')
             WHERE event_type IN ('listen', 'like', 'undislike')
             ORDER BY user_id, item_id
         """
         self.con.execute(query)
         self.con.execute(f"COPY train_pos_interactions TO '{self.positive_interactions_file}' (FORMAT PARQUET)")
+        print("Saved positive_interactions.parquet (with Encoded and Original IDs)")
 
 
     def _compute_user_avg_embeddings(self):
-        # Re-using the temp table from _save_positive_interactions logic if available, or querying again
+        # UPDATED: Save BOTH 'user_id' (Encoded) and 'uid' (Original)
         query = f"""
-            SELECT e.user_id, e.item_id, ANY_VALUE(emb.normalized_embed) AS normalized_embed
+            SELECT e.user_id, e.uid, e.item_id, ANY_VALUE(emb.normalized_embed) AS normalized_embed
             FROM read_parquet('{self.split_paths['train']}') e
             JOIN read_parquet('{self.embeddings_path}') emb ON e.item_id = emb.item_id
             WHERE e.event_type IN ('listen', 'like', 'undislike')
-            GROUP BY e.user_id, e.item_id
+            GROUP BY e.user_id, e.uid, e.item_id
         """
         df = self.con.execute(query).fetch_df()
 
-        # Numpy aggregation (faster/easier than DuckDB for array averaging sometimes)
         avg_embs = []
-        for user_id, group in df.groupby("user_id"):
+        for (user_id, uid), group in df.groupby(["user_id", "uid"]):
             embs_array = np.vstack(list(group["normalized_embed"]))
             avg_emb = np.mean(embs_array, axis=0)
-            avg_embs.append({"user_id": int(user_id), "avg_embed": avg_emb.tolist()})
+            avg_embs.append({
+                "user_id": int(user_id),
+                "uid": int(uid),
+                "avg_embed": avg_emb.tolist()
+            })
 
         pd.DataFrame(avg_embs).sort_values("user_id").to_parquet(self.filtered_user_embed_file, index=False)
+        print("Saved filtered_user_embed.parquet (with Encoded and Original IDs)")
 
 
     def prepare_baselines(self):
         print("\nPreparing baseline files...")
+        self._save_user_id_mapping()  # New mapping file
         self._save_filtered_user_ids()
         self._save_filtered_song_ids()
         self._save_filtered_audio_embeddings()
