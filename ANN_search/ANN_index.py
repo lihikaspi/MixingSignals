@@ -137,10 +137,11 @@ class ANNIndex:
         return results, rec_scores
 
 
-    def retrieve_recs(self):
+    def retrieve_recs(self, k=None):
         """End-to-end pipeline: load embeddings → build index → recommend."""
+        k = k or self.top_k
         self.load_embeddings()
         self.build_index()
         self.save()
-        results, _ = self.recommend(self.top_k)
+        results, _ = self.recommend(k)
         return results
