@@ -44,6 +44,10 @@ class GNNEvaluator:
         df = pd.read_parquet(self.scores_path)
         df = df.rename(columns={"user_id": "user_idx", "item_id": "item_idx"})
 
+        # Debug for dislikes
+        total_dislikes = (df['adjusted_score'] < 0).sum()
+        print(f"DEBUG (Internal GNN): Found {total_dislikes} Dislike interactions (score < 0) in {self.scores_path}")
+
         self.ground_truth = {}
 
         # Group by user for fast lookup
@@ -117,9 +121,6 @@ class GNNEvaluator:
         """
         Computes dot-product scores and retrieves Top-K indices for a batch of users.
         Uses mini-batching internally to prevent GPU OOM errors.
-
-        Returns:
-            (batch_topk_indices, batch_scores) as numpy arrays
         """
         all_topk = []
         all_scores = []
@@ -147,12 +148,14 @@ class GNNEvaluator:
         """Calculates NDCG@K for a single user given specific ground truth scores."""
         k = self.top_k
 
-        # Create a full relevance vector (sparse usually)
-        relevance = np.zeros(self.num_items, dtype=float)
-        relevance[gt_indices] = gt_scores
+        # Sparse lookup optimized
+        top_rel = np.zeros(len(topk_idx))
+        gt_map = {idx: score for idx, score in zip(gt_indices, gt_scores)}
+
+        for i, item_idx in enumerate(topk_idx):
+            top_rel[i] = gt_map.get(item_idx, 0.0)
 
         # DCG
-        top_rel = relevance[topk_idx]
         dcg = np.sum(top_rel / np.log2(np.arange(2, k + 2)))
 
         # IDCG
@@ -171,6 +174,7 @@ class GNNEvaluator:
         gt_base = gt["valid_base_rel"]
         gt_listen_plus = gt["valid_listen_plus_rel"]
         gt_like = gt["valid_like_rel"]
+        gt_seen = gt["valid_seen"]
 
         topk_set = set(topk_idx)
         metrics = {}
@@ -190,19 +194,25 @@ class GNNEvaluator:
         pos_items = gt_items[gt_adj > 0.5]
         metrics["hit_like_listen@k"] = float(len(set(pos_items) & topk_set) > 0)
 
-        # 3. Dislike FPR (False Positive Rate on Dislikes)
+        # 3. Dislike Rate (Precision of Negative Items)
         dislike_items = gt_items[gt_adj < 0]
-        metrics["dislike_fpr@k"] = 0.0
+        metrics["dislike_rate@k"] = 0.0
         if len(dislike_items) > 0:
-            metrics["dislike_fpr@k"] = float(len(set(dislike_items) & topk_set) > 0)
+            bad_recs_count = len(set(dislike_items) & topk_set)
+            metrics["dislike_rate@k"] = bad_recs_count / len(topk_idx)
 
-        # 4. Novelty (Fraction of Top-K not in interaction history)
-        all_interacted = set(gt_items)
-        unseen_count = sum(1 for i in topk_idx if i not in all_interacted)
-        metrics["novelty@k"] = unseen_count / self.top_k
+        # 4. Novelty (Based on Training Data)
+        # Identify items in ground truth that were SEEN in train
+        train_items = set(gt_items[gt_seen])
+
+        if len(topk_idx) > 0:
+            # Count recommended items that are NOT in the training set
+            new_items = [i for i in topk_idx if i not in train_items]
+            metrics["novelty@k"] = len(new_items) / len(topk_idx)
+        else:
+            metrics["novelty@k"] = 0.0
 
         # 5. AUC (Positive vs Negative discrimination)
-        # Using adjusted score to define pos (>0) vs neg (<0)
         pos_mask = gt_adj > 0
         neg_mask = gt_adj <= 0
 
@@ -242,7 +252,7 @@ class GNNEvaluator:
         agg_metrics = {
             "ndcg@k": [], "ndcg_raw@k": [],
             "ndcg_listen_plus@k": [], "ndcg_like@k": [], "hit_like@k": [],
-            "hit_like_listen@k": [], "auc": [], "dislike_fpr@k": [], "novelty@k": []
+            "hit_like_listen@k": [], "auc": [], "dislike_rate@k": [], "novelty@k": []
         }
 
         # 3. Process Users in Batches

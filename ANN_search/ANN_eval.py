@@ -13,11 +13,11 @@ class RecEvaluator:
     Optimized for speed using Numpy slicing instead of Pandas groupby.
     """
     def __init__(self, recs, config: Config):
-        self.gnn_recs = recs["gnn"]
-        self.content_recs = recs["content"]
-        self.popular_recs = recs["popular"]
-        self.random_recs = recs["random"]
-        self.cf_recs = recs["cf"]
+        self.gnn_recs = recs.get("gnn", {})
+        self.content_recs = recs.get("content", {})
+        self.popular_recs = recs.get("popular", {})
+        self.random_recs = recs.get("random", {})
+        self.cf_recs = recs.get("cf", {})
 
         self.top_k = config.ann.top_k
         self.relevance_scores = config.paths.test_scores_file
@@ -25,7 +25,7 @@ class RecEvaluator:
         self.mapping_path = config.paths.user_mapping
 
         print("Loading ground truth data (Optimized)...")
-        self.ground_truth = self._load_ground_truth_fast()
+        self.ground_truth, self.all_test_users = self._load_ground_truth_fast()
 
         print("Loading User ID Mapping...")
         self.user_map = self._load_user_mapping()
@@ -40,6 +40,11 @@ class RecEvaluator:
         df = pd.read_parquet(self.relevance_scores)
         df = df.rename(columns={"user_id": "user_idx", "item_id": "item_idx"})
 
+        # Check for dislikes
+        total_dislikes = (df['adjusted_score'] < 0).sum()
+        print(
+            f"DEBUG: Found {total_dislikes} Dislike interactions (score < 0) in Test Set out of {len(df)} total rows.")
+
         # Ensure sorted by user_idx for slicing
         df = df.sort_values("user_idx")
 
@@ -52,6 +57,12 @@ class RecEvaluator:
         base_arr = df['base_relevance'].values.astype(float)
         listen_arr = df['listen_plus_relevance'].values.astype(float)
         like_arr = df['like_relevance'].values.astype(float)
+
+        # Check for seen_in_train for Novelty
+        if 'seen_in_train' in df.columns:
+            seen_arr = df['seen_in_train'].values.astype(bool)
+        else:
+            seen_arr = np.zeros_like(adj_arr, dtype=bool)
 
         # Find split points (indices where user_id changes)
         unique_users, start_indices = np.unique(user_indices, return_index=True)
@@ -67,11 +78,12 @@ class RecEvaluator:
                 "adj": adj_arr[s:e],
                 "base": base_arr[s:e],
                 "listen_plus": listen_arr[s:e],
-                "like": like_arr[s:e]
+                "like": like_arr[s:e],
+                "seen": seen_arr[s:e]
             }
 
         print(f"Loaded Ground Truth for {len(gt_lookup)} users in {time.time() - t0:.2f}s")
-        return gt_lookup
+        return gt_lookup, unique_users
 
 
     def _load_user_mapping(self) -> Dict[int, int]:
@@ -82,6 +94,7 @@ class RecEvaluator:
         # Fast load
         df = pd.read_parquet(self.mapping_path)
         return dict(zip(df['user_id'], df['uid']))
+
 
     def _save_eval_results(self, results: dict, path: str):
         print(f"Saving results to {path}...")
@@ -112,23 +125,32 @@ class RecEvaluator:
 
     # --- Baselines ---
     def _popular_baseline(self):
-        self._save_eval_results(self._eval(self.popular_recs, "Popular"), self.eval_dir + "/popular_eval_results.json")
+        if self.popular_recs:
+            self._save_eval_results(self._eval(self.popular_recs, "Popular"),
+                                    self.eval_dir + "/popular_eval_results.json")
 
 
     def _random_baseline(self):
-        self._save_eval_results(self._eval(self.random_recs, "Random"), self.eval_dir + "/random_eval_results.json")
+        if self.random_recs:
+            self._save_eval_results(self._eval(self.random_recs, "Random"),
+                                    self.eval_dir + "/random_eval_results.json")
 
 
     def _cf_baseline(self):
-        self._save_eval_results(self._eval(self.cf_recs, "CF"), self.eval_dir + "/cf_eval_results.json")
+        if self.cf_recs:
+            self._save_eval_results(self._eval(self.cf_recs, "CF"),
+                                    self.eval_dir + "/cf_eval_results.json")
 
 
     def _content_baseline(self):
-        self._save_eval_results(self._eval(self.content_recs, "Content"), self.eval_dir + "/content_eval_results.json")
+        if self.content_recs:
+            self._save_eval_results(self._eval(self.content_recs, "Content"),
+                                    self.eval_dir + "/content_eval_results.json")
 
 
     def _eval_gnn_recs(self):
-        self._save_eval_results(self._eval(self.gnn_recs, "GNN"), self.eval_dir + "/gnn_eval_results.json")
+        if self.gnn_recs:
+            self._save_eval_results(self._eval(self.gnn_recs, "GNN"), self.eval_dir + "/gnn_eval_results.json")
 
 
     def _eval_baselines(self):
@@ -139,15 +161,16 @@ class RecEvaluator:
 
 
     # --- Metrics ---
-    def _calc_ndcg(self, topk_idx, relevance, gt_adj, k):
-        top_rel = np.maximum(relevance[topk_idx], 0)
-        dcg = np.sum(top_rel / np.log2(np.arange(2, len(top_rel) + 2)))
-
-        # Optimized IDCG: Sort only if needed
+    def _calc_ndcg(self, pred_rels, true_rels, k_val):
+        # DCG
+        gains = np.maximum(pred_rels, 0)
+        dcg = np.sum(gains / np.log2(np.arange(2, len(gains) + 2)))
         if dcg == 0: return 0.0
 
-        ideal = np.sort(np.maximum(gt_adj, 0))[::-1][:k]
+        # IDCG (Ideal sorting of all positive test items)
+        ideal = np.sort(np.maximum(true_rels, 0))[::-1][:k_val]
         idcg = np.sum(ideal / np.log2(np.arange(2, len(ideal) + 2)))
+
         return dcg / idcg if idcg > 0 else 0.0
 
 
@@ -158,74 +181,72 @@ class RecEvaluator:
 
         # Pre-allocate lists
         keys = ["ndcg@k", "ndcg_raw@k", "ndcg_listen_plus@k", "ndcg_like@k",
-                "hit_like@k", "hit_like_listen@k", "auc", "dislike_fpr@k", "novelty@k"]
+                "hit_like@k", "hit_like_listen@k", "dislike_rate@k", "novelty@k"]
         all_metrics = {key: [] for key in keys}
 
         count = 0
-        total = len(recs)
+        total = len(self.all_test_users)
 
-        # Loop Optimization: avoid attribute lookups in loop
-        gt_lookup = self.ground_truth
+        # Loop Optimization: Iterate over ALL test users
+        for uid in self.all_test_users:
+            gt_data = self.ground_truth[uid]
+            rec_items = recs.get(uid, [])  # Default to empty if no recs
 
-        for uid, rec_items in recs.items():
-            uid = int(uid)
-            if uid not in gt_lookup:
-                continue
-
-            gt_data = gt_lookup[uid]
-            topk_idx = rec_items[:k]
+            topk_idx = np.array(rec_items[:k], dtype=np.int64)
             topk_set = set(topk_idx)
 
             gt_items = gt_data["items"]
-
-            # Quick metrics
-            max_item = max(gt_items.max(), max(topk_idx)) + 1
-
-            # Create sparse-like dense arrays (only if needed)
-            # Optimization: Only create arrays for the items we care about?
-            # Current approach is fine for density < 1M items
-
             gt_adj = gt_data["adj"]
-            rel_adj = np.zeros(max_item, dtype=float)
-            rel_adj[gt_items] = gt_adj
-
             gt_base = gt_data["base"]
-            rel_base = np.zeros(max_item, dtype=float)
-            rel_base[gt_items] = gt_base
-
             gt_listen = gt_data["listen_plus"]
-            rel_listen = np.zeros(max_item, dtype=float)
-            rel_listen[gt_items] = gt_listen
-
             gt_like = gt_data["like"]
-            rel_like = np.zeros(max_item, dtype=float)
-            rel_like[gt_items] = gt_like
+            gt_seen = gt_data["seen"]
+
+            # Map GT items to their scores for fast lookup
+            # Use dictionary for sparse lookup instead of dense array
+            item_to_gt_idx = {item: i for i, item in enumerate(gt_items)}
+
+            rel_adj = np.zeros(len(topk_idx), dtype=float)
+            rel_base = np.zeros(len(topk_idx), dtype=float)
+            rel_listen = np.zeros(len(topk_idx), dtype=float)
+            rel_like = np.zeros(len(topk_idx), dtype=float)
+
+            for i, item in enumerate(topk_idx):
+                if item in item_to_gt_idx:
+                    idx = item_to_gt_idx[item]
+                    rel_adj[i] = gt_adj[idx]
+                    rel_base[i] = gt_base[idx]
+                    rel_listen[i] = gt_listen[idx]
+                    rel_like[i] = gt_like[idx]
 
             m = {}
-            m["ndcg@k"] = self._calc_ndcg(topk_idx, rel_adj, gt_adj, k)
-            m["ndcg_raw@k"] = self._calc_ndcg(topk_idx, rel_base, gt_base, k)
-            m["ndcg_listen_plus@k"] = self._calc_ndcg(topk_idx, rel_listen, gt_listen, k)
-            m["ndcg_like@k"] = self._calc_ndcg(topk_idx, rel_like, gt_like, k)
+            m["ndcg@k"] = self._calc_ndcg(rel_adj, gt_adj, k)
+            m["ndcg_raw@k"] = self._calc_ndcg(rel_base, gt_base, k)
+            m["ndcg_listen_plus@k"] = self._calc_ndcg(rel_listen, gt_listen, k)
+            m["ndcg_like@k"] = self._calc_ndcg(rel_like, gt_like, k)
 
-            like_items_set = set(gt_items[gt_adj > 1.0])
+            like_items_set = set(gt_items[gt_adj >= 1.0])
             m["hit_like@k"] = 1.0 if not like_items_set.isdisjoint(topk_set) else 0.0
 
-            pos_items_set = set(gt_items[gt_adj > 0.5])
+            pos_items_set = set(gt_items[gt_adj >= 0.5])
             m["hit_like_listen@k"] = 1.0 if not pos_items_set.isdisjoint(topk_set) else 0.0
 
-            # AUC is expensive and usually 0 for top-k, skip for speed if desired, but here we keep it 0
-            m["auc"] = 0.0
-
+            # Dislike Rate (Count of dislikes in top k / k)
             dislike_mask = gt_adj < 0
             if np.any(dislike_mask):
                 dislike_items_set = set(gt_items[dislike_mask])
-                m["dislike_fpr@k"] = 1.0 if not dislike_items_set.isdisjoint(topk_set) else 0.0
+                bad_recs_count = len(topk_set.intersection(dislike_items_set))
+                m["dislike_rate@k"] = bad_recs_count / len(topk_idx) if len(topk_idx) > 0 else 0.0
             else:
-                m["dislike_fpr@k"] = 0.0
+                m["dislike_rate@k"] = 0.0
 
-            # Novelty
-            # Faster than list comprehension
-            m["novelty@k"] = len(topk_set - set(gt_items)) / k
+            # Novelty (Items NOT in training set)
+            train_items_set = set(gt_items[gt_seen])
+            if len(topk_idx) > 0:
+                new_items = [x for x in topk_idx if x not in train_items_set]
+                m["novelty@k"] = len(new_items) / len(topk_idx)
+            else:
+                m["novelty@k"] = 0.0
 
             per_user_metrics[uid] = m
             for k_metric, val in m.items():
