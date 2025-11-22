@@ -20,8 +20,9 @@ class RecEvaluator:
         self.cf_recs = recs.get("cf", {})
 
         self.top_k = config.ann.top_k
+        self.test_k = config.ann.test_k
         self.relevance_scores = config.paths.test_scores_file
-        self.eval_dir = config.paths.eval_dir
+        self.base_eval_dir = config.paths.eval_dir
         self.mapping_path = config.paths.user_mapping
 
         print("Loading ground truth data (Optimized)...")
@@ -261,7 +262,13 @@ class RecEvaluator:
 
         return {"per_user": per_user_metrics, "avg": avg_metrics}
 
-
     def eval(self):
-        self._eval_gnn_recs()
-        self._eval_baselines()
+        for k in self.test_k:
+            self.top_k = k
+            # Create dir inside eval_dir for this k
+            k_eval_dir = os.path.join(self.base_eval_dir, f"top_{k}")
+            os.makedirs(k_eval_dir, exist_ok=True)
+            self.eval_dir = k_eval_dir
+            print(f"\n--- Evaluating for Top-{k} Recommendations ---")
+            self._eval_gnn_recs()
+            self._eval_baselines()
