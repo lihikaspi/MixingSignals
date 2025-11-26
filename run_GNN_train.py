@@ -31,6 +31,13 @@ def check_prev_files():
 
 
 def test_evaluation(model: LightGCN, train_graph: HeteroData):
+    """
+    evaluates the final GNN model on the test set.
+
+    Args:
+        model: trained GNN model
+        train_graph: the graph was trained on
+    """
     print("evaluating best model on test set...")
     test_evaluator = GNNEvaluator(model, train_graph, "test", config)
     test_metrics = test_evaluator.evaluate()
@@ -44,7 +51,7 @@ def test_evaluation(model: LightGCN, train_graph: HeteroData):
     print(f"  Hit@{k_hit} (like only): {test_metrics['hit_like@k']:.4f}")
     print(f"  Hit@{k_hit} (like+listen): {test_metrics['hit_like_listen@k']:.4f}")
     print(f"  AUC: {test_metrics['auc']:.4f}")
-    print(f"  Dislike-FPR@{k_hit}: {test_metrics['dislike_fpr@k']:.4f}")
+    print(f"  Dislike-rate@{k_hit}: {test_metrics['dislike_rate@k']:.4f}")
     print(f"  Novelty@{k_hit}: {test_metrics['novelty@k']:.4f}")
 
     with open(config.paths.test_eval, "w") as f:
@@ -54,38 +61,31 @@ def test_evaluation(model: LightGCN, train_graph: HeteroData):
 def save_final_embeddings(model: LightGCN, user_embed_path: str, song_embed_path: str):
     """
     Saves final user and song embeddings to disk.
+
+    Args:
+        model: trained GNN model
+        user_embed_path: path to save user embeddings to
+        song_embed_path: path to save song embeddings to
     """
     print("\nSaving final user and song embeddings")
     torch.cuda.empty_cache()
     model.eval()
 
     with torch.no_grad():
-        # Call the new CPU-based forward method.
         user_emb, item_emb, _ = model.forward_cpu()
 
-        # print("Converting final embeddings to NumPy...")
         user_emb_np = user_emb.numpy().astype(np.float32)
         item_emb_np = item_emb.numpy().astype(np.float32)
 
-        # --- KEY FIX: Save User Indices (0..N) to match test_scores.parquet ---
-        # model.user_original_ids are the UIDs (e.g. 1005).
-        # But test_scores uses indices (0, 1, 2...).
         user_ids_np = np.arange(model.num_users, dtype=np.int64)
-
-        # Items still use Original IDs because test_scores uses Original Item IDs
         item_ids_np = model.item_original_ids.cpu().numpy()
 
-        # Save to .npz files
-        # print(f"Saving user embeddings to {user_embed_path}...")
         np.savez(user_embed_path, embeddings=user_emb_np, original_ids=user_ids_np)
-
-        # print(f"Saving song embeddings to {song_embed_path}...")
         np.savez(song_embed_path, embeddings=item_emb_np, original_ids=item_ids_np)
 
     print("-------------------------------------------------")
     print(f"User embeddings saved to {user_embed_path}")
     print(f"Song embeddings saved to {song_embed_path}")
-    # print("Embedding saving process complete.")
 
 
 def main():

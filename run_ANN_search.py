@@ -30,6 +30,9 @@ def check_prev_files():
 
 
 def recommend_popular():
+    """
+    creates popularity-based recommendations for all users.
+    """
     print("making popularity-based recommendations")
     song_ids = np.load(config.paths.popular_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)
@@ -41,6 +44,9 @@ def recommend_popular():
 
 
 def recommend_random():
+    """
+    creates random recommendations for all users.
+    """
     print("making random recommendations ")
     song_ids = np.load(config.paths.filtered_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)

@@ -3,16 +3,19 @@ import pandas as pd
 from typing import Dict, List
 import json
 import os
-import time
 from config import Config
 
 
 class RecEvaluator:
     """
-    Evaluator class for ANN recommendations.
-    Optimized for speed using Numpy slicing instead of Pandas groupby.
+    Evaluator class for ANN and baseline recommendations.
     """
     def __init__(self, recs, config: Config):
+        """
+        Args:
+            recs: dict containing GNN-ANN and baseline recommendations. Keys are user IDs, values are lists of recommended song IDs.
+            config: configuration object
+        """
         self.gnn_recs = recs.get("gnn", {})
         self.content_recs = recs.get("content", {})
         self.popular_recs = recs.get("popular", {})
@@ -24,26 +27,18 @@ class RecEvaluator:
         self.eval_dir = config.paths.eval_dir
         self.mapping_path = config.paths.user_mapping
 
-        print("Loading ground truth data (Optimized)...")
         self.ground_truth, self.all_test_users = self._load_ground_truth_fast()
-
-        print("Loading User ID Mapping...")
         self.user_map = self._load_user_mapping()
 
 
     def _load_ground_truth_fast(self):
         """
-        Loads ground truth using Numpy arrays and slicing.
-        Much faster than pandas.groupby for large datasets.
+        Loads ground truth relevance scores and pre-processes them into a lookup dict.
+
+        Returns: lookup dict containing ground truth data for each user.
         """
-        t0 = time.time()
         df = pd.read_parquet(self.relevance_scores)
         df = df.rename(columns={"user_id": "user_idx", "item_id": "item_idx"})
-
-        # Check for dislikes
-        total_dislikes = (df['adjusted_score'] < 0).sum()
-        print(
-            f"DEBUG: Found {total_dislikes} Dislike interactions (score < 0) in Test Set out of {len(df)} total rows.")
 
         # Ensure sorted by user_idx for slicing
         df = df.sort_values("user_idx")
@@ -70,7 +65,7 @@ class RecEvaluator:
 
         gt_lookup = {}
 
-        # Build dictionary using slices (Fast)
+        # Build dictionary
         for i, uid in enumerate(unique_users):
             s, e = start_indices[i], end_indices[i]
             gt_lookup[uid] = {
@@ -82,11 +77,17 @@ class RecEvaluator:
                 "seen": seen_arr[s:e]
             }
 
-        print(f"Loaded Ground Truth for {len(gt_lookup)} users in {time.time() - t0:.2f}s")
+        print(f"Loaded Ground Truth for {len(gt_lookup)} users")
         return gt_lookup, unique_users
 
 
     def _load_user_mapping(self) -> Dict[int, int]:
+        """
+        loads users mapping from the train graph encoded IDs to original IDs
+
+        Returns:
+            dict mapping encoded IDs to original IDs. Returns empty dict if mapping file is not found.
+        """
         if not os.path.exists(self.mapping_path):
             print(f"WARNING: Mapping file not found at {self.mapping_path}. Output JSONs will use Encoded IDs.")
             return {}
@@ -97,6 +98,13 @@ class RecEvaluator:
 
 
     def _save_eval_results(self, results: dict, path: str):
+        """
+        saves evaluation results to a JSON file.
+
+        Args:
+            results: dict containing per-user and average metrics
+            path: path to save the JSON file to
+        """
         print(f"Saving results to {path}...")
         final_results = results.copy()
 
@@ -125,35 +133,53 @@ class RecEvaluator:
 
     # --- Baselines ---
     def _popular_baseline(self):
+        """
+        evaluates popular baseline recommendations. saves results to a JSON file.
+        """
         if self.popular_recs:
             self._save_eval_results(self._eval(self.popular_recs, "Popular"),
                                     self.eval_dir + "/popular_eval_results.json")
 
 
     def _random_baseline(self):
+        """
+        evaluates random baseline recommendations. saves results to a JSON file.
+        """
         if self.random_recs:
             self._save_eval_results(self._eval(self.random_recs, "Random"),
                                     self.eval_dir + "/random_eval_results.json")
 
 
     def _cf_baseline(self):
+        """
+        evaluates collaborative filtering baseline recommendations. saves results to a JSON file.
+        """
         if self.cf_recs:
             self._save_eval_results(self._eval(self.cf_recs, "CF"),
                                     self.eval_dir + "/cf_eval_results.json")
 
 
     def _content_baseline(self):
+        """
+        evaluates content-based baseline recommendations. saves results to a JSON file.
+        """
         if self.content_recs:
             self._save_eval_results(self._eval(self.content_recs, "Content"),
                                     self.eval_dir + "/content_eval_results.json")
 
 
     def _eval_gnn_recs(self):
+        """
+        evaluates GNN-ANN recommendations. saves results to a JSON file.
+        """
         if self.gnn_recs:
             self._save_eval_results(self._eval(self.gnn_recs, "GNN"), self.eval_dir + "/gnn_eval_results.json")
 
 
     def _eval_baselines(self):
+        """
+        evaluates all baselines. Results are saved to a JSON file.
+        """
         self._popular_baseline()
         self._random_baseline()
         self._cf_baseline()
@@ -162,6 +188,17 @@ class RecEvaluator:
 
     # --- Metrics ---
     def _calc_ndcg(self, pred_rels, true_rels, k_val):
+        """
+        Calculates NDCG@k for a given set of predicted and ground truth relevance scores.
+
+        Args:
+            pred_rels: array of predicted relevance scores
+            true_rels: array of ground truth relevance scores
+            k_val: k value for NDCG calculation
+
+        Returns:
+            NDCG@k score
+        """
         # DCG
         gains = np.maximum(pred_rels, 0)
         dcg = np.sum(gains / np.log2(np.arange(2, len(gains) + 2)))
@@ -175,6 +212,16 @@ class RecEvaluator:
 
 
     def _eval(self, recs: Dict[int, List[int]], name: str) -> Dict[str, Dict]:
+        """
+        evaluates a set of recommendations using all metrics
+
+        Args:
+            recs: dict containing user IDs as keys and list of recommended song IDs as values
+            name: name of the set of recommendations (e.g. "Popular", "GNN", etc.)
+
+        Returns:
+            dict containing per-user and average metrics for the given set of recommendations.
+        """
         print(f"Evaluating {name}...")
         k = self.top_k
         per_user_metrics = {}
@@ -187,7 +234,6 @@ class RecEvaluator:
         count = 0
         total = len(self.all_test_users)
 
-        # Loop Optimization: Iterate over ALL test users
         for uid in self.all_test_users:
             gt_data = self.ground_truth[uid]
             rec_items = recs.get(uid, [])  # Default to empty if no recs
@@ -202,8 +248,6 @@ class RecEvaluator:
             gt_like = gt_data["like"]
             gt_seen = gt_data["seen"]
 
-            # Map GT items to their scores for fast lookup
-            # Use dictionary for sparse lookup instead of dense array
             item_to_gt_idx = {item: i for i, item in enumerate(gt_items)}
 
             rel_adj = np.zeros(len(topk_idx), dtype=float)
@@ -263,5 +307,8 @@ class RecEvaluator:
 
 
     def eval(self):
+        """
+        evaluate GNN-ANN recommendations and all baselines. Results are saved to JSON files.
+        """
         self._eval_gnn_recs()
         self._eval_baselines()

@@ -13,6 +13,11 @@ class EventProcessor:
     """
 
     def __init__(self, con: duckdb.DuckDBPyConnection, config: Config):
+        """
+        Args:
+            con: DuckDB connection object.
+            config: Configuration object.
+        """
         self.con = con
         self.config = config
 
@@ -164,6 +169,12 @@ class EventProcessor:
     # ---------------------------------------------------------
 
     def _create_negative_event_tables(self, split: str = 'train'):
+        """
+        save the negative items in the train set in a temporary table
+
+        Args:
+            split: 'train' or 'val' or 'test'. default: 'train'
+        """
         self.con.execute("""
             CREATE TEMPORARY TABLE train_set_items AS
             SELECT DISTINCT item_id FROM split_data WHERE split = 'train'
@@ -179,6 +190,9 @@ class EventProcessor:
 
 
     def _save_in_graph_negatives(self):
+        """
+        save a parquet file with the train negative interactions
+        """
         query = f"""
             COPY (
                 SELECT neg.user_id, neg.item_id
@@ -191,6 +205,9 @@ class EventProcessor:
 
 
     def _save_cold_start_negatives(self):
+        """
+        save audio embeddings for cold-start negative interactions
+        """
         query = f"""
             COPY (
                 SELECT neg.user_id, neg.item_id, emb.normalized_embed
@@ -205,6 +222,9 @@ class EventProcessor:
 
 
     def _save_neg_interactions(self):
+        """
+        save the negative interactions from the train set
+        """
         print(f"Splitting negative 'train' interactions...")
         self._create_negative_event_tables(split='train')
         self._save_in_graph_negatives()
@@ -217,6 +237,9 @@ class EventProcessor:
     # ---------------------------------------------------------
 
     def _save_cold_start_songs(self):
+        """
+        save all cold start songs in a parquet file
+        """
         self.con.execute("""
                          CREATE
                          TEMPORARY TABLE IF NOT EXISTS train_graph_items_lookup AS
@@ -243,6 +266,9 @@ class EventProcessor:
 
 
     def _build_relevance_case_statement(self) -> str:
+        """
+        base relevance score calculation
+        """
         case_base = "CASE e.event_type\n"
         for etype, weight in self.weight.items():
             if etype == "listen":
@@ -254,6 +280,9 @@ class EventProcessor:
 
 
     def _create_raw_split_table(self, split: str, case_base: str):
+        """
+        split the data into raw tables for each split
+        """
         query = f"""
             CREATE TEMPORARY TABLE {split}_raw AS
             SELECT
@@ -283,6 +312,9 @@ class EventProcessor:
 
 
     def _create_aggregated_score_table(self, split: str):
+        """
+        aggregated scores calculation
+        """
         query = f"""
             CREATE TEMPORARY TABLE {split}_scores AS
             SELECT
@@ -301,6 +333,9 @@ class EventProcessor:
 
 
     def _create_final_score_table(self, split: str):
+        """
+        final adjusted scores calculation
+        """
         n = self.novelty
         boost_weight = n['train_penalty']
         max_fam = n['max_familiarity']
@@ -321,6 +356,13 @@ class EventProcessor:
 
 
     def _process_split(self, split: str, out_path: str):
+        """
+        split pipeline
+
+        Args:
+            split: 'val' or 'test'
+            out_path: output path for the processed scores
+        """
         case_base = self._build_relevance_case_statement()
         self._create_raw_split_table(split, case_base)
         self._create_aggregated_score_table(split)
@@ -343,6 +385,9 @@ class EventProcessor:
 
 
     def _compute_relevance_scores(self):
+        """
+        relevance scores pipeline
+        """
         print("Processing validation scores...")
         self._process_split('val', self.val_scores)
         print("Processing test scores...")
@@ -350,6 +395,9 @@ class EventProcessor:
 
 
     def split_data(self, split_ratios: dict = None):
+        """
+        split data pipeline
+        """
         if split_ratios is not None: self.split_ratios = split_ratios
         self._split_data()
         self._compute_relevance_scores()
@@ -387,6 +435,9 @@ class EventProcessor:
         self.con.execute("DROP TABLE all_users_union")
 
     def _save_filtered_user_ids(self):
+        """
+        save list of user IDs
+        """
         # Save standard ENCODED ids for index compatibility
         query = f"SELECT DISTINCT user_id FROM read_parquet('{self.split_paths['train']}') ORDER BY user_id"
         df = self.con.execute(query).fetch_df()
@@ -395,6 +446,9 @@ class EventProcessor:
 
 
     def _save_filtered_song_ids(self):
+        """
+        save list of song IDs
+        """
         query = f"""
             WITH unique_items AS (
                 SELECT DISTINCT item_id FROM read_parquet('{self.split_paths['train']}')
@@ -407,6 +461,9 @@ class EventProcessor:
 
 
     def _save_filtered_audio_embeddings(self):
+        """
+        save filtered audio embeddings
+        """
         query = f"""
             CREATE OR REPLACE TEMPORARY TABLE filtered_songs_emb AS
             WITH unique_items AS (
@@ -424,6 +481,9 @@ class EventProcessor:
 
 
     def _save_most_popular_songs(self):
+        """
+        save most popular songs
+        """
         query = f"""
             SELECT item_id FROM read_parquet('{self.split_paths['train']}')
             WHERE event_type IN ('listen', 'like', 'undislike')
@@ -434,6 +494,9 @@ class EventProcessor:
 
 
     def _save_positive_interactions(self):
+        """
+        save positive interactions (listen, like, undislike)
+        """
         # UPDATED: Save BOTH 'user_id' (Encoded) and 'uid' (Original)
         query = f"""
             CREATE OR REPLACE TEMPORARY TABLE train_pos_interactions AS
@@ -448,6 +511,9 @@ class EventProcessor:
 
 
     def _compute_user_avg_embeddings(self):
+        """
+        create user content-based embeddings
+        """
         # UPDATED: Save BOTH 'user_id' (Encoded) and 'uid' (Original)
         query = f"""
             SELECT e.user_id, e.uid, e.item_id, ANY_VALUE(emb.normalized_embed) AS normalized_embed
@@ -473,6 +539,9 @@ class EventProcessor:
 
 
     def prepare_baselines(self):
+        """
+        baseline preparation pipeline
+        """
         print("\nPreparing baseline files...")
         self._save_user_id_mapping()  # New mapping file
         self._save_filtered_user_ids()

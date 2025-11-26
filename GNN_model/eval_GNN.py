@@ -2,13 +2,17 @@ import torch
 import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple
 from torch_geometric.data import HeteroData
+from GNN_model.GNN_class import LightGCN
 from config import Config
 
 
 class GNNEvaluator:
-    def __init__(self, model: torch.nn.Module, graph: HeteroData, eval_set: str, config: Config):
+    """
+    Evaluator class for GNN-based models.
+    """
+    def __init__(self, model: LightGCN, graph: HeteroData, eval_set: str, config: Config):
         """
         Args:
             model: trained GNN model
@@ -22,7 +26,6 @@ class GNNEvaluator:
         self.top_k = config.gnn.k_hit
         self.eval_batch_size = config.gnn.eval_batch_size
 
-        # OOM Safety: Batch size for GPU matrix multiplication
         self.gpu_safe_batch_size = 64
 
         self.num_users = graph['user'].num_nodes
@@ -121,6 +124,13 @@ class GNNEvaluator:
         """
         Computes dot-product scores and retrieves Top-K indices for a batch of users.
         Uses mini-batching internally to prevent GPU OOM errors.
+
+        Args:
+            batch_user_indices: array of user indices to process
+            item_emb_gpu: pre-computed item embeddings on GPU (already moved to device)
+
+        Returns:
+            top-k recommendations and predicted scores for each user in the batch
         """
         all_topk = []
         all_scores = []
@@ -145,7 +155,17 @@ class GNNEvaluator:
 
 
     def _calc_ndcg(self, topk_idx: np.ndarray, gt_indices: np.ndarray, gt_scores: np.ndarray) -> float:
-        """Calculates NDCG@K for a single user given specific ground truth scores."""
+        """
+        Calculates NDCG@K for a single user given specific ground truth scores.
+
+        Args:
+            topk_idx: array of top-k item indices
+            gt_indices: array of original item IDs in ground truth
+            gt_scores: array of ground truth relevance scores for each item (adjusted, base, etc.)
+
+        Returns:
+            NDCG@k score for the given user and top-k items
+        """
         k = self.top_k
 
         # Sparse lookup optimized
@@ -167,7 +187,17 @@ class GNNEvaluator:
 
     def _compute_metrics_for_user(self, user_idx: int, topk_idx: np.ndarray, pred_scores: np.ndarray) -> Dict[
         str, float]:
-        """Calculates all metrics for a single user."""
+        """
+        Calculates all metrics for a single user.
+
+        Args:
+            user_idx: user ID
+            topk_idx: array of top-k item indices
+            pred_scores: array of predicted scores for each item in top-k
+
+        Returns:
+            dict containing all metrics for the given user and top-k items
+        """
         gt = self.ground_truth[user_idx]
         gt_items = gt["graph_idx"]
         gt_adj = gt["valid_adj_scores"]
@@ -238,6 +268,9 @@ class GNNEvaluator:
     def evaluate(self) -> Dict[str, float]:
         """
         Main entry point: Batched, GPU-accelerated evaluation.
+
+        Returns:
+            dict containing all metrics calculated for all users in the dataset.
         """
         print(">>> Starting evaluation (batched, GPU)...")
 

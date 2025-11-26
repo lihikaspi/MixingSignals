@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch.nn.functional as F
+from torch_geometric.data import HeteroData
 from tqdm import tqdm
 import json
 import math
@@ -15,11 +16,15 @@ import pandas as pd
 
 class BPRDataset(Dataset):
     """
-    Advanced BPR Dataset.
-    Uses pre-computed hybrid ratio from the graph as positive weight.
+    creates the BPR Dataset.
     """
-
-    def __init__(self, train_graph, config: Config, raw_user2neg: dict):
+    def __init__(self, train_graph: HeteroData, config: Config, raw_user2neg: dict):
+        """
+        Args:
+            train_graph: HeteroData object containing the train graph.
+            config: Config object containing the hyperparameters.
+            raw_user2neg: dict containing the raw user-item negatives.
+        """
         self.config = config
         self.num_items = int(train_graph['item'].num_nodes)
         self.raw_user2neg = raw_user2neg
@@ -41,7 +46,15 @@ class BPRDataset(Dataset):
 
 
     def _process_graph_edges(self, graph):
-        """Parses graph edges to build positive interaction maps."""
+        """
+        Parses graph edges to build positive interaction maps.
+
+        Args:
+            graph: HeteroData object containing the train graph.
+
+        Returns:
+            positive interaction maps.
+        """
         edge_index = graph['user', 'interacts', 'item'].edge_index.cpu()
         edge_attr = graph['user', 'interacts', 'item'].edge_attr.cpu()
 
@@ -76,7 +89,12 @@ class BPRDataset(Dataset):
 
 
     def _clean_negative_samples(self):
-        """Filters raw negatives to ensure they don't overlap with positives."""
+        """
+        Filters raw negatives to ensure they don't overlap with positives.
+
+        Returns:
+            cleaned negative interaction map.
+        """
         clean_map = {}
         for u, neg_tuples in self.raw_user2neg.items():
             pos_set = self.all_users_pos_sets.get(u, set())
@@ -136,7 +154,15 @@ class BPRDataset(Dataset):
 
 
 def collate_bpr_advanced(batch):
-    """Collates BPR batch, handling variable audio embeddings."""
+    """
+    Collates BPR batch, handling variable audio embeddings.
+
+    Args:
+        batch: list of tuples containing user, positive item, negative item, positive audio embedding, negative audio embedding, positive weight, negative weight.
+
+    Returns:
+        BPR dataset instances
+    """
     batch_size = len(batch)
     k = len(batch[0][2])
 
@@ -168,7 +194,16 @@ def collate_bpr_advanced(batch):
 
 
 class GNNTrainer:
-    def __init__(self, model: LightGCN, train_graph, config: Config):
+    """
+    Trainer class for LightGCN model.
+    """
+    def __init__(self, model: LightGCN, train_graph: HeteroData, config: Config):
+        """
+        Args:
+            model: LightGCN model instance.
+            train_graph: HeteroData object containing the train graph.
+            config: Config object containing the hyperparameters.
+        """
         self.config = config
         self.device = torch.device('cpu')  # Force CPU for training loop
         self.model = model.to(self.device)
@@ -196,7 +231,7 @@ class GNNTrainer:
 
         # Metrics tracking
         self.best_ndcg = 0.0
-        self.best_metrics = None  # <--- Added to track best dictionary
+        self.best_metrics = None
 
 
     def _init_hyperparameters(self, config):

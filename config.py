@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 import torch
-import torch.distributed as dist
 from typing import List, Tuple, Dict
 import os
 import numpy as np

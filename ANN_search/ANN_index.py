@@ -9,6 +9,11 @@ class ANNIndex:
     build ANN index for user and song embeddings.
     """
     def __init__(self, index_type: str, config: Config):
+        """
+        Args:
+            index_type: "gnn" or "content" identifier for the index type.
+            config: configuration object.
+        """
         self.index_type = index_type
         self.ann_index_path = getattr(config.paths, f"{self.index_type}_index")
         self.ann_song_ids_path = getattr(config.paths, f"{self.index_type}_song_ids")
@@ -47,7 +52,7 @@ class ANNIndex:
 
 
     def _load_gnn_embeddings(self):
-        """Load user and song embeddings, combining GNN and audio-based ones."""
+        """Load user and song embeddings, combining GNN and cold-start audio-based ones."""
         # ---- Load user embeddings ----
         user_data = np.load(self.user_embeddings_gnn)
         self.user_embs = user_data['embeddings']
@@ -118,7 +123,15 @@ class ANNIndex:
 
 
     def recommend(self, k: int = None):
-        """Get top-k song recommendations for each user embedding."""
+        """
+        Get top-k song recommendations for each user embedding.
+
+        Args:
+            k: number of recommendations to return. Defaults to top_k from config.
+
+        Returns:
+            dict mapping user IDs to lists of recommended song IDs.
+        """
         if self.index is None or self.song_ids is None:
             raise ValueError("Index not loaded or built.")
         if self.user_embs is None:
@@ -134,13 +147,21 @@ class ANNIndex:
         results = {uid: recs.tolist() for uid, recs in zip(self.user_ids, rec_song_ids)}
 
         print(f"Generated top-{k} recommendations for {len(self.user_embs)} users.\n")
-        return results, rec_scores
+        return results
 
 
-    def retrieve_recs(self):
-        """End-to-end pipeline: load embeddings → build index → recommend."""
+    def retrieve_recs(self, k: int = None):
+        """
+        End-to-end pipeline: load embeddings → build index → recommend.
+
+        Args:
+            k: number of recommendations to return. Defaults to top_k from config.
+
+        Returns:
+            dict mapping user IDs to lists of recommended song IDs.
+        """
         self.load_embeddings()
         self.build_index()
         self.save()
-        results, _ = self.recommend(self.top_k)
+        results, _ = self.recommend(k)
         return results

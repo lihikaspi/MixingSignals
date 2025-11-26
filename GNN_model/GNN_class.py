@@ -56,7 +56,13 @@ class EdgeWeightMLP(nn.Module):
 
 class LightGCN(nn.Module):
     def __init__(self, data: HeteroData, config: Config):
+        """
+        Args:
+            data: HeteroData object containing the graph structure and node attributes.
+            config: Config object containing model hyperparameters.
+        """
         print('>>> starting GNN init')
+
         super().__init__()
         self.config = config
         self.num_layers = config.gnn.num_layers
@@ -85,7 +91,12 @@ class LightGCN(nn.Module):
 
 
     def _init_node_embeddings(self, data):
-        """Initializes user, artist, and album embeddings."""
+        """
+        Initializes user, artist, and album embeddings.
+
+        Args:
+            data: HeteroData object containing the graph structure and node attributes.
+        """
         # User Embeddings
         self.user_emb = nn.Embedding(self.num_users, self.embed_dim)
         nn.init.xavier_uniform_(self.user_emb.weight)
@@ -113,7 +124,12 @@ class LightGCN(nn.Module):
 
 
     def _register_item_data(self, data):
-        """Registers item-related static tensors as buffers."""
+        """
+        Registers item-related static tensors as buffers.
+
+        Args:
+            data: HeteroData object containing the graph structure and node attributes.
+        """
         # Sanitize Audio Embeddings
         raw_audio_emb = data['item'].x.cpu()
         if torch.isnan(raw_audio_emb).any() or torch.isinf(raw_audio_emb).any():
@@ -128,7 +144,12 @@ class LightGCN(nn.Module):
 
 
     def _build_homogeneous_graph(self, data):
-        """Converts bipartite edge index/attr to homogeneous structure."""
+        """
+        Converts bipartite edge index/attr to homogeneous structure.
+
+        Args:
+            data: HeteroData object containing the graph structure and node attributes.
+        """
         # Edge features
         edge_index_bipartite = data['user', 'interacts', 'item'].edge_index.cpu()
         edge_attr_bipartite = data['user', 'interacts', 'item'].edge_attr.cpu()
@@ -154,6 +175,13 @@ class LightGCN(nn.Module):
     def _get_item_embeddings(self, item_nodes, device):
         """
         Combine audio + metadata embeddings using Concat + Linear Projection.
+
+        Args:
+            item_nodes: Tensor containing item IDs.
+            device: Device to run the operation on.
+
+        Returns:
+            item embeddings of shape [num_items, embed_dim]
         """
         item_nodes_cpu = item_nodes.cpu()
 
@@ -181,6 +209,12 @@ class LightGCN(nn.Module):
     def _compute_edge_weights(self, device):
         """
         Helper to run MLP on edge attributes to get learnable weights.
+
+        Args:
+            device: Device to run the operation on.
+
+        Returns:
+            MLP-learned edge weights of shape [num_edges, 1]
         """
         # Ensure inputs are on the target device
         attr = self.edge_attr_init.to(device)
@@ -197,9 +231,12 @@ class LightGCN(nn.Module):
         return weights
 
 
-    def forward(self, return_projections=False):
+    def forward(self):
         """
-        Full-graph forward (used for evaluation / saving final embeddings).
+        Full-graph forward (GPU version).
+
+        Returns:
+            model-learned user and item embeddings
         """
         device = next(self.parameters()).device
 
@@ -232,14 +269,15 @@ class LightGCN(nn.Module):
         user_emb = x[:self.num_users]
         item_emb = x[self.num_users:]
 
-        align_loss = torch.tensor(0.0, device=device)
-        return user_emb, item_emb, align_loss
+        return user_emb, item_emb
 
 
     def forward_cpu(self):
         """
         Performs the full-graph forward pass with GNN propagation on CPU.
-        Also runs the Edge MLP on CPU.
+
+        Returns:
+            model-learned user and item embeddings
         """
         # --- 1. Set up devices ---
         cpu_device = torch.device('cpu')
