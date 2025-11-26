@@ -147,6 +147,7 @@ print(f"PyG version: {torch_geometric.__version__}")
 │   ├── train_GNN.py            # Training 
 │   ├── eval_GNN.py             # GNN evaluation 
 │   ├── explore_graph.py        # Training graph statistics 
+│   ├── song_diagnostics.py     # Song embeddigs scales
 │   └── hyperparam_search.py    # Optuna study
 
 ├── ANN_search/

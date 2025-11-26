@@ -8,7 +8,7 @@ from GNN_model.train_GNN import GNNTrainer
 from GNN_model.GNN_class import LightGCN
 from GNN_model.eval_GNN import GNNEvaluator
 from config import config
-from GNN_model.song_embed_diagnostics import diagnose_embedding_scales
+from GNN_model.song_diagnostics import diagnose_embedding_scales
 
 
 def check_prev_files():
