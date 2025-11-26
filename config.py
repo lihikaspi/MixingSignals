@@ -267,6 +267,7 @@ class ANNConfig:
     top_sim_items: int = 50
     nprobe: int = 32
     nlist: int = 4096
+    test_k: List[int] = field(default_factory=lambda: [10, 100])
 
     seed: int = 42
     np.random.seed(seed)

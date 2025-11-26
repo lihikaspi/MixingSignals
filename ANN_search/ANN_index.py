@@ -160,8 +160,9 @@ class ANNIndex:
         Returns:
             dict mapping user IDs to lists of recommended song IDs.
         """
+        k = k or self.top_k
         self.load_embeddings()
         self.build_index()
         self.save()
-        results, _ = self.recommend(k)
+        results = self.recommend(k)
         return results

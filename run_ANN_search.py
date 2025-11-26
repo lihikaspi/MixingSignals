@@ -29,21 +29,21 @@ def check_prev_files():
         print("All needed files are present! starting indexing ... ")
 
 
-def recommend_popular():
+def recommend_popular(max_k: int):
     """
     creates popularity-based recommendations for all users.
     """
     print("making popularity-based recommendations")
     song_ids = np.load(config.paths.popular_song_ids)
     user_ids = np.load(config.paths.filtered_user_ids)
-    top_k_recs = song_ids[:config.ann.top_k].tolist()
+    top_k_recs = song_ids[:max_k].tolist()
 
     results = {uid: top_k_recs for uid in user_ids}
 
     return results
 
 
-def recommend_random():
+def recommend_random(max_k: int):
     """
     creates random recommendations for all users.
     """
@@ -52,7 +52,7 @@ def recommend_random():
     user_ids = np.load(config.paths.filtered_user_ids)
     num_users = len(user_ids)
     num_songs = len(song_ids)
-    rec_song_ids = np.random.randint(num_songs, size=(num_users, config.ann.top_k))
+    rec_song_ids = np.random.randint(num_songs, size=(num_users, max_k))
 
     results = {uid: recs.tolist() for uid, recs in zip(user_ids, rec_song_ids)}
 
@@ -109,19 +109,20 @@ def prepare_cf_index(n_components=64) -> ANNIndex:
 
 
 def main():
+    max_k = max(config.ann.test_k)
     gnn_index = ANNIndex("gnn", config)
-    gnn_recs = gnn_index.retrieve_recs()
+    gnn_recs = gnn_index.retrieve_recs(max_k)
 
     content_index = ANNIndex("content", config)
-    content_recs = content_index.retrieve_recs()
+    content_recs = content_index.retrieve_recs(max_k)
 
     cf_index_obj = prepare_cf_index()
     cf_index_obj.build_index()
     cf_index_obj.save()
-    cf_recs, _ = cf_index_obj.recommend()
+    cf_recs, _ = cf_index_obj.recommend(k=max_k)
 
-    popular_recs = recommend_popular()
-    random_recs = recommend_random()
+    popular_recs = recommend_popular(max_k)
+    random_recs = recommend_random(max_k)
 
     recs = {
         "gnn": gnn_recs,

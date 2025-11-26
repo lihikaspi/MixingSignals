@@ -23,11 +23,15 @@ class RecEvaluator:
         self.cf_recs = recs.get("cf", {})
 
         self.top_k = config.ann.top_k
+        self.test_k = config.ann.test_k
         self.relevance_scores = config.paths.test_scores_file
-        self.eval_dir = config.paths.eval_dir
+        self.base_eval_dir = config.paths.eval_dir
         self.mapping_path = config.paths.user_mapping
 
+        print("Loading ground truth data (Optimized)...")
         self.ground_truth, self.all_test_users = self._load_ground_truth_fast()
+
+        print("Loading User ID Mapping...")
         self.user_map = self._load_user_mapping()
 
 
@@ -39,6 +43,11 @@ class RecEvaluator:
         """
         df = pd.read_parquet(self.relevance_scores)
         df = df.rename(columns={"user_id": "user_idx", "item_id": "item_idx"})
+
+        # Check for dislikes
+        total_dislikes = (df['adjusted_score'] < 0).sum()
+        print(
+            f"DEBUG: Found {total_dislikes} Dislike interactions (score < 0) in Test Set out of {len(df)} total rows.")
 
         # Ensure sorted by user_idx for slicing
         df = df.sort_values("user_idx")
@@ -312,3 +321,12 @@ class RecEvaluator:
         """
         self._eval_gnn_recs()
         self._eval_baselines()
+        for k in self.test_k:
+            self.top_k = k
+            # Create dir inside eval_dir for this k
+            k_eval_dir = os.path.join(self.base_eval_dir, f"top_{k}")
+            os.makedirs(k_eval_dir, exist_ok=True)
+            self.eval_dir = k_eval_dir
+            print(f"\n--- Evaluating for Top-{k} Recommendations ---")
+            self._eval_gnn_recs()
+            self._eval_baselines()
